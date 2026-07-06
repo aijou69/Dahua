@@ -104,29 +104,42 @@ async function checkP2P(serial) {
 
   if (!res1) return { serial, online: false, error: 'Main server timeout' };
 
-  let relayAddr = null;
-  const dsMatch = res1.match(/<DS>([^<]+)<\/DS>/);
+  // The main server returns <US> (User/P2P Server) — this is where we send the probe.
+  // <DS> (Device Server) is a different server that does NOT handle /probe/device/.
   const usMatch = res1.match(/<US>([^<]+)<\/US>/);
-  if (dsMatch) relayAddr = dsMatch[1].trim();
-  else if (usMatch) relayAddr = usMatch[1].trim();
+  const dsMatch = res1.match(/<DS>([^<]+)<\/DS>/);
 
-  if (!relayAddr) return { serial, online: false, error: 'No relay server in response' };
+  const usAddr = usMatch ? usMatch[1].trim() : null;
+  const dsAddr = dsMatch ? dsMatch[1].trim() : null;
 
-  const parts = relayAddr.split(':');
-  const relayIp = parts[0];
-  const relayPort = parts.length > 1 ? parseInt(parts[1]) : MAIN_PORT;
+  if (!usAddr) {
+    return { serial, online: false, relay: dsAddr, error: 'Device not registered (no US in response)' };
+  }
+
+  // Step 2: Probe the device through the P2P server (US)
+  const parts = usAddr.split(':');
+  const usIp = parts[0];
+  const usPort = parts.length > 1 ? parseInt(parts[1]) : MAIN_PORT;
 
   const req2 = buildRequest('/probe/device/' + serial);
-  const probeRes = await sendUDP(relayIp, relayPort, req2);
+  const probeRes = await sendUDP(usIp, usPort, req2);
 
-  if (!probeRes) return { serial, online: false, relay: relayAddr, error: 'Device offline (probe timeout)' };
+  if (!probeRes) {
+    return { serial, online: false, relay: usAddr, error: 'Device offline (probe timeout)' };
+  }
 
-  const isOnline = probeRes.includes('200 OK');
+  // Parse HTTP response code from probe
+  const codeMatch = probeRes.match(/^DHGET[^]*HTTP\/1\.1 (\d{3})/);
+  const code = codeMatch ? parseInt(codeMatch[1]) : 0;
+
+  // 200 = online, 4xx/5xx = offline
+  const isOnline = code === 200;
   return {
     serial,
     online: isOnline,
-    relay: relayAddr,
-    error: isOnline ? null : 'Probe returned non-200'
+    relay: usAddr,
+    device_server: dsAddr,
+    error: isOnline ? null : 'Probe returned code ' + code
   };
 }
 
