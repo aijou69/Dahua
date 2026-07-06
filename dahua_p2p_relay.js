@@ -128,8 +128,10 @@ async function checkP2P(serial) {
     return { serial, online: false, relay: usAddr, error: 'Device offline (probe timeout)' };
   }
 
-  // Parse HTTP response code from probe
-  const codeMatch = probeRes.match(/^DHGET[^]*HTTP\/1\.1 (\d{3})/);
+  // Parse response: first line is like "DHP2P/1.1 200 OK" or "HTTP/1.1 200 OK"
+  // The status code is the 3-digit number on the first line
+  const firstLine = probeRes.split('\r\n')[0];
+  const codeMatch = firstLine.match(/(\d{3})/);
   const code = codeMatch ? parseInt(codeMatch[1]) : 0;
 
   // 200 = online, 4xx/5xx = offline
@@ -139,6 +141,8 @@ async function checkP2P(serial) {
     online: isOnline,
     relay: usAddr,
     device_server: dsAddr,
+    probe_code: code,
+    probe_first_line: firstLine,
     error: isOnline ? null : 'Probe returned code ' + code
   };
 }
