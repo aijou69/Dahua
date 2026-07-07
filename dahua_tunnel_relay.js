@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v3.4
+ * Dahua P2P Tunnel Relay Server v3.6
  * ===================================
- * CRITICAL FIX: UDP message queue — messages arriving between
- *   operations are now buffered instead of silently dropped.
- *   This was the root cause of all channel timeout failures.
+ * v3.6: FIXED channel request body format — uses XML format
+ *   <body><Identify>0 0 0 0 0 0 0 0</Identify><PubAddr>...</PubAddr></body>
+ *   instead of plain text. Also fixed relay/start body to use XML.
+ *   Reordered: relay agent + start BEFORE channel request.
+ *   This was the root cause of ALL channel timeouts.
  *
  * Based on: https://github.com/khoanguyen-3fc/dh-p2p
  */
@@ -331,25 +333,16 @@ async function establishTunnel(serial, username, password, targetPort) {
     var key = null;
     var nonce = null;
     var aid = crypto.randomBytes(8);
-    var laddr = '127.0.0.1:' + deviceSock.lport;
-    var ipaddr = 'true' + laddr;
     var auth = '';
 
     if (username && password) {
       dtype = 1;
       key = getDeviceKey(username, password);
       nonce = Math.floor(Math.random() * 0x7FFFFFFF);
-      laddr = getEnc(key, nonce, laddr);
-      ipaddr = 'true' + laddr;
-      auth = getDeviceAuth(username, key, nonce, laddr);
+      auth = getDeviceAuth(username, key, nonce, '');
     }
 
-    var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
-    var channelBody = auth + aidHex + ipaddr + '5.0.0';
-    // Send channel request to MAIN_SERVER only (matches reference)
-    await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
-
-    // Get relay agent
+    // Get relay agent (must happen BEFORE channel request)
     mainSock.setRemote(relayServer, relayPort);
     var agentRes = await mainSock.request('/relay/agent');
     var token = agentRes.xmlBody.Token;
@@ -358,24 +351,47 @@ async function establishTunnel(serial, username, password, targetPort) {
     var agentServer = agentParts[0];
     var agentPort = parseInt(agentParts[1]);
 
-    // Start relay — device won't respond until this completes
+    // Start relay with XML body (PoC format: <body><Client>:0</Client></body>)
     mainSock.setRemote(agentServer, agentPort);
-    await mainSock.request('/relay/start/' + token, ':0');
+    var startRes = await mainSock.request('/relay/start/' + token, '<body><Client>:0</Client></body>');
 
-    // Read device channel response (may have been queued during relay setup)
-    var devRaw = await deviceSock.recv(10000);
-    var devParsed = parseP2PResponse(devRaw);
-    if (devParsed.code < 200) {
-      devRaw = await deviceSock.recv(5000);
+    // Build channel request with XML body format (PoC format)
+    // PubAddr = agent server:port (tells device which relay to connect to)
+    var channelBody = '<body><Identify>0 0 0 0 0 0 0 0</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
+    // Send channel request to MAIN server
+    deviceSock.setRemote(mainIp, MAIN_PORT);
+    await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
+
+    // Read device channel response: HTTP 100 (Trying) first, then HTTP 200
+    // STUN packets may arrive between 100 and 200
+    var devParsed = null;
+    for (var chanAttempt = 0; chanAttempt < 8; chanAttempt++) {
+      var devRaw = await deviceSock.recv(10000);
+      // Skip STUN packets (binary, not ASCII HTTP)
+      if (devRaw[0] !== 0x44 && devRaw[0] !== 0x48) { // not 'D' (DHPOST) or 'H' (HTTP)
+        continue;
+      }
       devParsed = parseP2PResponse(devRaw);
+      if (devParsed.code === 200 || devParsed.code >= 400) break;
+      // code 100 = keep reading
     }
+    if (!devParsed) throw new Error('Device channel timeout (no response)');
     if (devParsed.code >= 400) {
       if (dtype === 0 && devParsed.code === 403) throw new Error('AUTH_REQUIRED');
       throw new Error('Device channel error: ' + devParsed.code + ' ' + devParsed.status);
     }
 
+    // Extract device's Identify (used as aid for NAT traversal)
+    var devIdentify = devParsed.xmlBody.Identify;
+    if (devIdentify) {
+      var idParts = devIdentify.split(' ');
+      for (var ip = 0; ip < 8 && ip < idParts.length; ip++) {
+        aid[ip] = parseInt(idParts[ip], 16) || 0;
+      }
+    }
+
     var deviceLaddr = devParsed.xmlBody.LocalAddr;
-    if (dtype > 0) {
+    if (dtype > 0 && devParsed.xmlBody.Nonce) {
       deviceLaddr = getDec(key, devParsed.xmlBody.Nonce, deviceLaddr);
     }
 
@@ -385,11 +401,12 @@ async function establishTunnel(serial, username, password, targetPort) {
     var devicePort = parseInt(pubParts[1]);
     deviceSock.setRemote(deviceServer, devicePort);
 
-    // Register relay channel
+    // Register relay channel (XML body format)
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = '';
-    if (dtype > 0) relayAuth = getDeviceAuth(username, key, nonce);
-    await mainSock.request('/device/' + serial + '/relay-channel', relayAuth + agentServer + ':' + agentPort, false);
+    if (dtype > 0) relayAuth = getDeviceAuth(username, key, nonce, '');
+    var relayChannelBody = '<body><Identify>' + relayAuth + '</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
+    await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
 
     mainSock.setRemote(agentServer, agentPort);
     await mainSock.recv(5000);
@@ -676,7 +693,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.4', features: ['status','tunnel','cgi','debug','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.6', features: ['status','tunnel','cgi','debug','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -689,37 +706,57 @@ var server = http.createServer(async function(req, res) {
       await mainSock.bind(); mainSock.setRemote(mainIp, MAIN_PORT);
       steps.push('Probe: ' + (await mainSock.request('/probe/p2psrv')).code);
       var onlineRes = await mainSock.request('/online/p2psrv/' + debugSerial);
-      steps.push('Online: US=' + (onlineRes.xmlBody.US||'none'));
-      var usParts = (onlineRes.xmlBody.US||'').split(':');
-      if (usParts[0]) {
-        var usSock = new P2PSocket(); await usSock.bind(); usSock.setRemote(usParts[0], parseInt(usParts[1]));
-        steps.push('Dev probe: ' + (await usSock.request('/probe/device/'+debugSerial)).code);
-        var devInfo = await usSock.request('/info/device/'+debugSerial);
-        steps.push('Dev info: keys=' + Object.keys(devInfo.xmlBody).join(','));
-        usSock.close();
-      }
+      var usAddr = onlineRes.xmlBody.US || 'none';
+      steps.push('Online: US=' + usAddr);
+      var usParts = usAddr.split(':');
+      var usServer = usParts[0]; var usPort = parseInt(usParts[1]);
+
+      // Probe + info through US
+      var usSock = new P2PSocket(); await usSock.bind(); usSock.setRemote(usServer, usPort);
+      steps.push('Dev probe: ' + (await usSock.request('/probe/device/'+debugSerial)).code);
+      var devInfo = await usSock.request('/info/device/'+debugSerial);
+      steps.push('Dev info: ' + devInfo.body.substring(0, 200));
+      usSock.close();
+
       var relayRes = await mainSock.request('/online/relay');
-      steps.push('Relay: ' + (relayRes.xmlBody.Address||'none'));
-      var rParts = (relayRes.xmlBody.Address||'').split(':');
-      var deviceSock = new P2PSocket(); await deviceSock.bind(); deviceSock.setRemote(mainIp, MAIN_PORT);
-      var aid = crypto.randomBytes(8);
-      var aidHex = Array.from(aid).map(function(b){return b.toString(16);}).join(' ');
-      await deviceSock.request('/device/'+debugSerial+'/p2p-channel', aidHex+'true127.0.0.1:'+deviceSock.lport+'5.0.0', false);
-      steps.push('Channel sent');
+      var relayAddr = relayRes.xmlBody.Address || 'none';
+      steps.push('Relay: ' + relayAddr);
+      var rParts = relayAddr.split(':');
+
+      // Get relay agent + token
       mainSock.setRemote(rParts[0], parseInt(rParts[1]));
       var agentRes = await mainSock.request('/relay/agent');
-      steps.push('Agent: ' + (agentRes.xmlBody.Agent||'none'));
-      var aParts = (agentRes.xmlBody.Agent||'').split(':');
-      // FIX: must start relay before device responds
+      var agentAddr = agentRes.xmlBody.Agent || 'none';
+      var token = agentRes.xmlBody.Token || '';
+      steps.push('Agent: ' + agentAddr + ' Token=' + token);
+      var aParts = agentAddr.split(':');
+
+      // Start relay FIRST (XML body)
       mainSock.setRemote(aParts[0], parseInt(aParts[1]));
-      await mainSock.request('/relay/start/'+agentRes.xmlBody.Token, ':0');
-      steps.push('Relay started');
-      try {
-        var devRaw = await deviceSock.recv(10000);
-        var devParsed = parseP2PResponse(devRaw);
-        steps.push('Device resp: code='+devParsed.code+' keys='+Object.keys(devParsed.xmlBody).join(','));
-      } catch(e) { steps.push('Device resp FAILED: '+e.message); }
-      deviceSock.close(); mainSock.close();
+      var dbgStart = await mainSock.request('/relay/start/'+token, '<body><Client>:0</Client></body>');
+      steps.push('Relay start: ' + dbgStart.code);
+
+      // === Channel request with XML body format (v3.6 fix) ===
+      var sockA = new P2PSocket(); await sockA.bind(); sockA.setRemote(mainIp, MAIN_PORT);
+      var channelBody = '<body><Identify>0 0 0 0 0 0 0 0</Identify><PubAddr>' + aParts[0] + ':' + parseInt(aParts[1]) + '</PubAddr></body>\r\n';
+      await sockA.request('/device/'+debugSerial+'/p2p-channel', channelBody, false);
+      steps.push('Channel request sent (XML body, port '+sockA.lport+')');
+      // Read response: HTTP 100 then HTTP 200, skipping STUN packets
+      var gotResponse = false;
+      for (var di = 0; di < 8; di++) {
+        try {
+          var dRaw = await sockA.recv(8000);
+          if (dRaw[0] !== 0x44 && dRaw[0] !== 0x48) { steps.push('  (STUN packet, skipping)'); continue; }
+          var dResp = parseP2PResponse(dRaw);
+          steps.push('RESP code=' + dResp.code + ' body=' + dResp.body.substring(0,200));
+          if (dResp.code === 200) { steps.push('SUCCESS! Keys: ' + Object.keys(dResp.xmlBody).join(',')); gotResponse = true; break; }
+          if (dResp.code >= 400) { steps.push('ERROR: ' + dResp.code); gotResponse = true; break; }
+        } catch(e) { steps.push('FAILED: ' + e.message); break; }
+      }
+      if (!gotResponse) steps.push('No HTTP response received');
+      sockA.close();
+
+      mainSock.close();
     } catch(e) { steps.push('FATAL: '+e.message); }
     res.writeHead(200, {'Content-Type':'application/json'});
     return res.end(JSON.stringify({serial:debugSerial, steps:steps}));
@@ -759,5 +796,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.4 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.6 running on port ' + PORT);
 });
