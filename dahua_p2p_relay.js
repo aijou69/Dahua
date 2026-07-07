@@ -97,6 +97,23 @@ function sendUDP(ip, port, message) {
   });
 }
 
+function mapDeviceType(dtid, serial) {
+  if (dtid) {
+    const d = dtid.toLowerCase();
+    if (d.indexOf('ipc') >= 0 || d.indexOf('ipcam') >= 0) return 'IPC';
+    if (d.indexOf('nvr') >= 0) return 'NVR';
+    if (d.indexOf('xvr') >= 0 || d.indexOf('hcvr') >= 0) return 'XVR';
+    if (d.indexOf('vto') >= 0) return 'VTO';
+    if (d.indexOf('vth') >= 0) return 'VTH';
+    if (d.indexOf('sd') >= 0 || d.indexOf('speeddome') >= 0) return 'SD';
+  }
+  if (serial && serial.length > 0) {
+    const snMap = {'1':'VTO','2':'VTH','3':'IPC','4':'NVR','5':'XVR','6':'SD','7':'Decoder','8':'AccessControl'};
+    return snMap[serial[0]] || 'Unknown';
+  }
+  return 'Unknown';
+}
+
 async function checkP2P(serial) {
   const mainIp = await resolveHostname(MAIN_SERVER);
   const req1 = buildRequest('/online/p2psrv/' + serial);
@@ -104,16 +121,19 @@ async function checkP2P(serial) {
 
   if (!res1) return { serial, online: false, error: 'Main server timeout' };
 
-  // The main server returns <US> (User/P2P Server) — this is where we send the probe.
-  // <DS> (Device Server) is a different server that does NOT handle /probe/device/.
-  const usMatch = res1.match(/<US>([^<]+)<\/US>/);
-  const dsMatch = res1.match(/<DS>([^<]+)<\/DS>/);
+  // Parse ALL XML tags from US response (US, DS, DTID, DID, etc.)
+  const usResponse = {};
+  const tagRegex = /<(\w+)>([^<]+)<\/\1>/g;
+  let tagMatch;
+  while ((tagMatch = tagRegex.exec(res1)) !== null) {
+    usResponse[tagMatch[1]] = tagMatch[2].trim();
+  }
 
-  const usAddr = usMatch ? usMatch[1].trim() : null;
-  const dsAddr = dsMatch ? dsMatch[1].trim() : null;
+  const usAddr = usResponse.US || null;
+  const dsAddr = usResponse.DS || null;
 
   if (!usAddr) {
-    return { serial, online: false, relay: dsAddr, error: 'Device not registered (no US in response)' };
+    return { serial, online: false, relay: dsAddr, us_response: usResponse, device_type: mapDeviceType(usResponse.DTID, serial), error: 'Device not registered (no US in response)' };
   }
 
   // Step 2: Probe the device through the P2P server (US)
@@ -125,17 +145,29 @@ async function checkP2P(serial) {
   const probeRes = await sendUDP(usIp, usPort, req2);
 
   if (!probeRes) {
-    return { serial, online: false, relay: usAddr, error: 'Device offline (probe timeout)' };
+    return { serial, online: false, relay: usAddr, device_server: dsAddr, us_response: usResponse, device_type: mapDeviceType(usResponse.DTID, serial), error: 'Device offline (probe timeout)' };
   }
 
-  // Parse response: first line is like "DHP2P/1.1 200 OK" or "HTTP/1.1 200 OK"
-  // The status code is the 3-digit number on the first line
-  const firstLine = probeRes.split('\r\n')[0];
+  // Parse ALL headers from probe response
+  const probeLines = probeRes.split('\r\n');
+  const firstLine = probeLines[0];
   const codeMatch = firstLine.match(/(\d{3})/);
   const code = codeMatch ? parseInt(codeMatch[1]) : 0;
 
+  const probeHeaders = {};
+  for (let i = 1; i < probeLines.length; i++) {
+    const hLine = probeLines[i];
+    const colonIdx = hLine.indexOf(':');
+    if (colonIdx > 0) {
+      const hKey = hLine.substring(0, colonIdx).trim();
+      const hVal = hLine.substring(colonIdx + 1).trim();
+      if (hKey) probeHeaders[hKey] = hVal;
+    }
+  }
+
   // 200 = online, 4xx/5xx = offline
   const isOnline = code === 200;
+  const dtid = probeHeaders.DTID || usResponse.DTID || null;
   return {
     serial,
     online: isOnline,
@@ -143,6 +175,16 @@ async function checkP2P(serial) {
     device_server: dsAddr,
     probe_code: code,
     probe_first_line: firstLine,
+    probe_headers: probeHeaders,
+    us_response: usResponse,
+    dtid: dtid,
+    device_type: mapDeviceType(dtid, serial),
+    did: probeHeaders.DID || usResponse.DID || serial,
+    rid: probeHeaders.RID || usResponse.RID || null,
+    rsp: probeHeaders.RSP || null,
+    firmware: probeHeaders.Version || probeHeaders.BuildDate || probeHeaders.FirmwareVersion || null,
+    hardware: probeHeaders.HardwareVersion || probeHeaders.HWVersion || null,
+    model: probeHeaders.DeviceType || probeHeaders.Model || probeHeaders.ProductName || null,
     error: isOnline ? null : 'Probe returned code ' + code
   };
 }
