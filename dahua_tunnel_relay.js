@@ -833,7 +833,8 @@ var server = http.createServer(async function(req, res) {
       // Start relay (plain text)
       dfMain.setRemote(dfAParts[0], parseInt(dfAParts[1]));
       var dfStart = await dfMain.request('/relay/start/'+dfToken, ':0');
-      dfSteps.push('Relay start (plain): ' + dfStart.code);
+      dfSteps.push('Relay start (plain): code=' + dfStart.code + ' body=' + dfStart.body.substring(0, 300));
+      dfSteps.push('Relay start xml: ' + JSON.stringify(dfStart.xmlBody));
 
       // Channel request (XML body — v4.0: XML works for p2p-channel)
       var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
@@ -866,18 +867,39 @@ var server = http.createServer(async function(req, res) {
         await dfMain.request('/device/'+dfSerial+'/relay-channel', dfRelayChanBody, false);
         dfSteps.push('Relay-channel sent (plain text)');
 
-        // PTCP handshake with agent (3-attempt SYN retry)
+        // Read agent response after relay-channel registration
         dfMain._msgQueue = [];
         dfMain.setRemote(dfAParts[0], parseInt(dfAParts[1]));
-        try { await dfMain.recv(3000); } catch(e) {}
+        try {
+          var agentResp = await dfMain.recv(5000);
+          var agentStr = agentResp.toString('utf8').substring(0, 300);
+          var agentMagic = agentResp.length >= 4 ? agentResp.toString('ascii', 0, 4) : 'short';
+          dfSteps.push('Agent resp: len=' + agentResp.length + ' magic=' + JSON.stringify(agentMagic) + ' text=' + agentStr);
+        } catch(e) { dfSteps.push('Agent resp: ' + e.message); }
         dfMain._msgQueue = [];
 
+        // PTCP handshake with agent (3-attempt SYN retry)
         var dfSynOk = false;
         for (var dfSyn = 0; dfSyn < 3; dfSyn++) {
           dfMain._msgQueue = [];
           await dfMain.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-          try { await dfMain.readPTCP(8000); dfSynOk = true; dfSteps.push('PTCP SYN ACK received (attempt ' + (dfSyn+1) + ')'); break; }
-          catch(e) { dfSteps.push('PTCP SYN attempt ' + (dfSyn+1) + ' FAILED: ' + e.message); }
+          dfSteps.push('PTCP SYN sent (attempt ' + (dfSyn+1) + ') to ' + dfAParts[0] + ':' + parseInt(dfAParts[1]));
+          try {
+            // Manual recv to log raw data before readPTCP
+            var synRaw = await dfMain.recv(8000);
+            var synMagic = synRaw.length >= 4 ? synRaw.toString('ascii', 0, 4) : 'short';
+            dfSteps.push('  recv: len=' + synRaw.length + ' magic=' + JSON.stringify(synMagic));
+            if (synMagic === 'PTCP' && synRaw.length >= 24) {
+              var synParsed = dfMain.parsePTCP(synRaw);
+              dfMain.ptcpRecv += synParsed.body.length;
+              dfMain.rmid = synParsed.lmid;
+              dfSynOk = true;
+              dfSteps.push('PTCP SYN ACK received! body_len=' + synParsed.body.length);
+              break;
+            } else {
+              dfSteps.push('  NOT PTCP, hex=' + synRaw.toString('hex').substring(0, 60));
+            }
+          } catch(e) { dfSteps.push('PTCP SYN attempt ' + (dfSyn+1) + ' FAILED: ' + e.message); }
         }
         if (!dfSynOk) dfSteps.push('PTCP handshake with agent FAILED after 3 attempts');
         else {
