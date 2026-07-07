@@ -2,11 +2,10 @@
 /**
  * Dahua P2P Tunnel Relay Server v3.6
  * ===================================
- * v3.6: FIXED channel request body format — uses XML format
- *   <body><Identify>0 0 0 0 0 0 0 0</Identify><PubAddr>...</PubAddr></body>
- *   instead of plain text. Also fixed relay/start body to use XML.
- *   Reordered: relay agent + start BEFORE channel request.
- *   This was the root cause of ALL channel timeouts.
+ * v3.7: FIXED channel response parsing — device returns PLAIN TEXT, not XML.
+ *   Body format: Identify(hex) + auth(bool) + LocalAddr(ip:port) + PubAddr(ip:port)
+ *   Added fallback parser that extracts IP:port pairs with regex.
+ *   v3.6: FIXED channel request body format — uses XML format
  *
  * Based on: https://github.com/khoanguyen-3fc/dh-p2p
  */
@@ -57,6 +56,20 @@ function buildP2PRequest(method, path, body) {
   req += '\r\n';
   if (body) req += body;
   return Buffer.from(req, 'utf8');
+}
+
+function parseChannelBody(body, xmlBody) {
+  if (xmlBody.PubAddr) return xmlBody;
+  var ipPortRegex = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})/g;
+  var ipMatches = [];
+  var ipm;
+  while ((ipm = ipPortRegex.exec(body)) !== null) { ipMatches.push(ipm[0]); }
+  var idMatch = body.match(/^([0-9a-fA-F]{2}(?: [0-9a-fA-F]{2})+)/);
+  if (idMatch) xmlBody.Identify = idMatch[1].trim();
+  if (body.indexOf('true') >= 0) xmlBody.Auth = 'true'; else xmlBody.Auth = 'false';
+  if (ipMatches.length >= 1) xmlBody.LocalAddr = ipMatches[0];
+  if (ipMatches.length >= 2) xmlBody.PubAddr = ipMatches[1];
+  return xmlBody;
 }
 
 function parseP2PResponse(data) {
@@ -381,6 +394,9 @@ async function establishTunnel(serial, username, password, targetPort) {
       throw new Error('Device channel error: ' + devParsed.code + ' ' + devParsed.status);
     }
 
+    // Parse channel response body (fallback for plain text format)
+    devParsed.xmlBody = parseChannelBody(devParsed.body, devParsed.xmlBody);
+
     // Extract device's Identify (used as aid for NAT traversal)
     var devIdentify = devParsed.xmlBody.Identify;
     if (devIdentify) {
@@ -693,7 +709,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.6', features: ['status','tunnel','cgi','debug','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.7', features: ['status','tunnel','cgi','debug','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -749,7 +765,11 @@ var server = http.createServer(async function(req, res) {
           if (dRaw[0] !== 0x44 && dRaw[0] !== 0x48) { steps.push('  (STUN packet, skipping)'); continue; }
           var dResp = parseP2PResponse(dRaw);
           steps.push('RESP code=' + dResp.code + ' body=' + dResp.body.substring(0,200));
-          if (dResp.code === 200) { steps.push('SUCCESS! Keys: ' + Object.keys(dResp.xmlBody).join(',')); gotResponse = true; break; }
+          if (dResp.code === 200) {
+            var dbgParsed = parseChannelBody(dResp.body, dResp.xmlBody);
+            steps.push('SUCCESS! Parsed: Identify=' + (dbgParsed.Identify||'none') + ' LocalAddr=' + (dbgParsed.LocalAddr||'none') + ' PubAddr=' + (dbgParsed.PubAddr||'none'));
+            gotResponse = true; break;
+          }
           if (dResp.code >= 400) { steps.push('ERROR: ' + dResp.code); gotResponse = true; break; }
         } catch(e) { steps.push('FAILED: ' + e.message); break; }
       }
@@ -796,5 +816,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.6 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.7 running on port ' + PORT);
 });
