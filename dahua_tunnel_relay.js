@@ -386,7 +386,14 @@ async function establishTunnel(serial, username, password, targetPort) {
 
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
     var channelBody = auth + aidHex + ipaddr + '5.0.0';
+    // Try main server first
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
+    // Also try US server directly (some firmware versions respond better)
+    var usChannelSock = new P2PSocket();
+    await usChannelSock.bind();
+    usChannelSock.setRemote(usServer, usPort);
+    try { await usChannelSock.request('/device/' + serial + '/p2p-channel', channelBody, false); } catch(e) {}
+    // Keep usChannelSock open to listen for device response too
 
     // Step 6: Get relay agent
     mainSock.setRemote(relayServer, relayPort);
@@ -402,11 +409,18 @@ async function establishTunnel(serial, username, password, targetPort) {
     await mainSock.request('/relay/start/' + token, ':0');
 
     // Step 8: Read device channel response
-    var devRaw = await deviceSock.recv(5000);
-    var devParsed = parseP2PResponse(devRaw);
+    var devRaw = null;
+    var devParsed = null;
+    // Try reading from deviceSock first (main server path)
+    try { devRaw = await deviceSock.recv(8000); devParsed = parseP2PResponse(devRaw); } catch(e) {}
+    // If no response, try usChannelSock (US server path)
+    if (!devParsed || devParsed.code < 200) {
+      try { devRaw = await usChannelSock.recv(8000); devParsed = parseP2PResponse(devRaw); } catch(e) {}
+    }
+    if (!devParsed) throw new Error('Device channel timeout (no response from main or US server)');
     if (devParsed.code < 200) {
-      devRaw = await deviceSock.recv(5000);
-      devParsed = parseP2PResponse(devRaw);
+      try { devRaw = await deviceSock.recv(5000); devParsed = parseP2PResponse(devRaw); } catch(e) {}
+      if (!devParsed || devParsed.code < 200) { try { devRaw = await usChannelSock.recv(5000); devParsed = parseP2PResponse(devRaw); } catch(e) {} }
     }
     if (devParsed.code >= 400) {
       if (dtype === 0 && devParsed.code === 403) throw new Error('AUTH_REQUIRED');
@@ -522,6 +536,7 @@ async function establishTunnel(serial, username, password, targetPort) {
   } catch (err) {
     mainSock.close();
     deviceSock.close();
+    try { usChannelSock.close(); } catch(e) {}
     throw err;
   }
 }
@@ -884,7 +899,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.2', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.3', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
   }
 
   // Debug endpoint - tests each step of tunnel establishment
@@ -1059,7 +1074,7 @@ server.on('error', function(err) {
 });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.2 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.3 running on port ' + PORT);
   console.log('Endpoints:');
   console.log('  GET  /health      - Health check');
   console.log('  GET  /debug/:sn   - Debug tunnel steps');
