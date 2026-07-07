@@ -815,7 +815,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.0', features: ['status', 'tunnel', 'cgi', 'debug'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.0', features: ['status', 'tunnel', 'cgi', 'debug', 'exploit'] }));
   }
 
   // Debug endpoint - tests each step of tunnel establishment
@@ -941,19 +941,6 @@ var server = http.createServer(async function(req, res) {
     }
   }
 
-  var serial = req.url.replace(/^\//, '').split('?')[0];
-  if (serial && serial.length >= 10) {
-    try {
-      var result = await checkP2P(serial);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(result));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: err.message }));
-    }
-  }
-
-
   // Exploit endpoint - CVE-2021-33044 user injection
   if (req.url === '/exploit_adduser' && req.method === 'POST') {
     var exploitBody = await readBody(req);
@@ -967,6 +954,18 @@ var server = http.createServer(async function(req, res) {
     } catch (exploitErr) {
       res.writeHead(500, {'Content-Type':'application/json'});
       return res.end(JSON.stringify({error: exploitErr.message}));
+    }
+  }
+
+  var serial = req.url.replace(/^\//, '').split('?')[0];
+  if (serial && serial.length >= 10) {
+    try {
+      var result = await checkP2P(serial);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: err.message }));
     }
   }
 
