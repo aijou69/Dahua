@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v3.6
+ * Dahua P2P Tunnel Relay Server v3.8
  * ===================================
+ * v3.8: FIXED PTCP "Invalid magic" error — readPTCP now skips non-PTCP packets
+ *   (STUN/NAT residue); clears msgQueue before device PTCP handshake;
+ *   try/catch in NAT traversal loop so timeout doesn't kill the tunnel.
  * v3.7: FIXED channel response parsing — device returns PLAIN TEXT, not XML.
  *   Body format: Identify(hex) + auth(bool) + LocalAddr(ip:port) + PubAddr(ip:port)
  *   Added fallback parser that extracts IP:port pairs with regex.
@@ -271,12 +274,22 @@ P2PSocket.prototype.requestPTCP = function(body) {
 
 P2PSocket.prototype.readPTCP = function(timeout) {
   var self = this;
-  return self.recv(timeout || 5000).then(function(data) {
-    var parsed = self.parsePTCP(data);
-    self.ptcpRecv += parsed.body.length;
-    self.rmid = parsed.lmid;
-    return parsed;
-  });
+  var deadline = Date.now() + (timeout || 5000);
+  function attempt() {
+    var remaining = deadline - Date.now();
+    if (remaining <= 0) return Promise.reject(new Error('Timeout (' + (timeout||5000) + 'ms)'));
+    return self.recv(remaining).then(function(data) {
+      // Skip non-PTCP packets (STUN, NAT responses, etc. left in queue)
+      if (data.length < 24 || data.toString('ascii', 0, 4) !== 'PTCP') {
+        return attempt();
+      }
+      var parsed = self.parsePTCP(data);
+      self.ptcpRecv += parsed.body.length;
+      self.rmid = parsed.lmid;
+      return parsed;
+    });
+  }
+  return attempt();
 };
 
 P2PSocket.prototype.close = function() {
@@ -478,8 +491,12 @@ async function establishTunnel(serial, username, password, targetPort) {
 
     for (var i = 0; i < 5; i++) {
       await deviceSock.send(natPkt3);
-      for (var j = 0; j < 5; j++) await deviceSock.recv(5000);
+      for (var j = 0; j < 5; j++) {
+        try { await deviceSock.recv(2000); } catch(e) { break; }
+      }
     }
+    // Clear any leftover NAT/STUN packets before PTCP handshake
+    deviceSock._msgQueue = [];
 
     // PTCP handshake with device
     await deviceSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
@@ -709,7 +726,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '3.7', features: ['status','tunnel','cgi','debug','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '3.8', features: ['status','tunnel','cgi','debug','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -816,5 +833,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v3.7 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v3.8 running on port ' + PORT);
 });
