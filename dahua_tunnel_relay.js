@@ -868,15 +868,25 @@ async function checkAuth(serial, username, password) {
     await mainSock.request('/relay/start/' + token, ':0');
     result.steps.push('Relay started');
 
-    // v4.14: Register relay-channel WITH shouldRead=true.
-    // relay-channel is sent to mainIp:MAIN_PORT — mainSock has NAT mapping with
-    // the main server (from initial probe), so the response gets through Render's NAT.
-    // Device returns 200 (valid creds) or 403 (invalid) as the relay-channel response.
+    // v4.14: Send relay-channel manually with 30s timeout (device needs time to connect to agent).
+    // relay-channel goes to mainIp:MAIN_PORT — mainSock has NAT mapping with main server,
+    // so the response gets through Render's NAT. Device returns 200 (valid) or 403 (invalid).
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = getDeviceAuth(username, key, nonce, '');
     var relayChannelBody = relayAuth + agentParts[0] + ':' + parseInt(agentParts[1]);
-    var relayChanRes = await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, true);
-    result.steps.push('Relay-channel sent (waiting response)');
+    var relayChanReq = buildP2PRequest('DHPOST', '/device/' + serial + '/relay-channel', relayChannelBody);
+    await mainSock.send(relayChanReq);
+    result.steps.push('Relay-channel sent (waiting 30s response)');
+
+    var relayChanRes = null;
+    for (var rcAttempt = 0; rcAttempt < 8; rcAttempt++) {
+      try {
+        var rcRaw = await mainSock.recv(30000);
+        if (rcRaw[0] !== 0x44 && rcRaw[0] !== 0x48) continue;
+        var rcParsed = parseP2PResponse(rcRaw);
+        if (rcParsed.code === 200 || rcParsed.code >= 400) { relayChanRes = rcParsed; break; }
+      } catch(e) { break; }
+    }
 
     if (relayChanRes) {
       result.steps.push('Relay-channel response: code=' + relayChanRes.code);
