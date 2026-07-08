@@ -803,14 +803,14 @@ async function checkP2P(serial) {
   });
 }
 
-// v4.9: Validate credentials via p2p-channel WITH auth — no PTCP/tunnel needed.
-// v4.10: Register relay-channel BEFORE reading response to route through relay agent.
-// v4.11: DON'T clear queues — response may have arrived during relay setup.
-// v4.12: Send channel request to US SERVER (not main) and do probe/info on deviceSock.
-//        This creates a NAT mapping between deviceSock and the US server, which is
-//        where the channel response originates. On Render's symmetric NAT, the
-//        response was blocked because deviceSock only had a mapping with the main server.
-// Device returns 200 (valid) or 403 (invalid) at the channel response step.
+// v4.13: CREDENTIAL VALIDATION VIA PTCP HANDSHAKE (not channel response).
+// Previous versions tried to read the device's channel response (200/403) directly,
+// but Render's symmetric NAT blocks it (response comes from device/US IP, not main IP).
+// New approach: send channel with auth → register relay-channel → PTCP handshake
+// with relay agent. The PTCP handshake goes THROUGH the agent (mainSock has NAT
+// mapping with agent from relay/start). If creds are valid, device accepts channel,
+// connects to agent, and PTCP SYN-ACK arrives. If invalid (403), device doesn't
+// connect to agent → PTCP timeout = invalid credentials.
 async function checkAuth(serial, username, password) {
   var result = { serial: serial, authenticated: false, steps: [] };
   var mainSock = null, deviceSock = null;
@@ -826,19 +826,14 @@ async function checkAuth(serial, username, password) {
     var usAddr = onlineRes.xmlBody.US;
     if (!usAddr) { result.error = 'Device not registered'; return result; }
     var usParts = usAddr.split(':');
-    var usServer = usParts[0];
-    var usPort = parseInt(usParts[1]);
     result.steps.push('US: ' + usAddr);
 
-    // v4.12: Do probe/device + info/device on DEVICE SOCK (not a separate socket).
-    // This creates a NAT mapping between deviceSock and the US server, so the
-    // device's channel response (which arrives FROM the US server) can get through
-    // Render's symmetric NAT. Previously this was done on a separate socket that
-    // was closed — deviceSock had no NAT mapping with the US server.
-    deviceSock.setRemote(usServer, usPort);
-    await deviceSock.request('/probe/device/' + serial);
-    await deviceSock.request('/info/device/' + serial);
-    result.steps.push('Device probe+info OK (via deviceSock→US)');
+    // Probe+info device through US (separate socket, matching establishTunnel)
+    var usSock = new P2PSocket(); await usSock.bind(); usSock.setRemote(usParts[0], parseInt(usParts[1]));
+    await usSock.request('/probe/device/' + serial);
+    await usSock.request('/info/device/' + serial);
+    usSock.close();
+    result.steps.push('Device probe+info OK');
 
     var relayRes = await mainSock.request('/online/relay');
     var relayAddr = relayRes.xmlBody.Address;
@@ -853,17 +848,14 @@ async function checkAuth(serial, username, password) {
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
     var laddrStr = '127.0.0.1:' + deviceSock.lport;
     var encLaddr = getEnc(key, nonce, laddrStr);
-    // v2 format: auth + aidHex + 'true' + encLaddr + '5.0.0'
     var channelBody = auth + aidHex + 'true' + encLaddr + '5.0.0';
 
-    // v4.12: Send channel request to US SERVER (not main server).
-    // The device is registered with the US server, and the channel response
-    // comes FROM the US server. By sending the channel request to the US server
-    // from deviceSock, the NAT mapping already exists for the response.
-    deviceSock.setRemote(usServer, usPort);
+    // Send channel request to main server (matching establishTunnel)
+    deviceSock.setRemote(mainIp, MAIN_PORT);
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
-    result.steps.push('Channel sent to US (with auth)');
+    result.steps.push('Channel sent (with auth)');
 
+    // Get relay agent
     mainSock.setRemote(relayParts[0], parseInt(relayParts[1]));
     var agentRes = await mainSock.request('/relay/agent');
     var token = agentRes.xmlBody.Token;
@@ -871,75 +863,40 @@ async function checkAuth(serial, username, password) {
     var agentParts = agentAddr.split(':');
     result.steps.push('Agent: ' + agentAddr);
 
+    // Start relay
     mainSock.setRemote(agentParts[0], parseInt(agentParts[1]));
     await mainSock.request('/relay/start/' + token, ':0');
     result.steps.push('Relay started');
 
-    // v4.10: Register relay-channel so device can route response via relay agent.
+    // Register relay-channel — tells device to connect to relay agent
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = getDeviceAuth(username, key, nonce, '');
     var relayChannelBody = relayAuth + agentParts[0] + ':' + parseInt(agentParts[1]);
     await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
-    result.steps.push('Relay-channel registered (route via agent)');
+    result.steps.push('Relay-channel registered');
 
-    // v4.11: DON'T clear queues — the device response may have already arrived
-    // during relay/agent + relay/start steps. Poll both sockets' queues for the
-    // channel response, checking any queued messages first, then waiting for new ones.
-    var devParsed = null;
+    // Read agent initial packet (STUN), discard — provides delay for device to connect
+    mainSock.setRemote(agentParts[0], parseInt(agentParts[1]));
+    try { await mainSock.recv(5000); result.steps.push('Agent initial packet received'); }
+    catch(e) { result.steps.push('Agent initial packet: ' + e.message); }
 
-    // Check queued messages first (response may have arrived during relay setup)
-    var allQueued = [];
-    while (deviceSock._msgQueue.length > 0) allQueued.push({ data: deviceSock._msgQueue.shift(), src: 'deviceSock' });
-    while (mainSock._msgQueue.length > 0) allQueued.push({ data: mainSock._msgQueue.shift(), src: 'mainSock' });
-    for (var qi = 0; qi < allQueued.length; qi++) {
-      var qItem = allQueued[qi];
-      result.steps.push('Queued on ' + qItem.src + ': len=' + qItem.data.length + ' first=0x' + qItem.data[0].toString(16));
-      if (qItem.data.length >= 4 && (qItem.data[0] === 0x44 || qItem.data[0] === 0x48)) {
-        devParsed = parseP2PResponse(qItem.data);
-        if (devParsed.code === 200 || devParsed.code >= 400) break;
-        devParsed = null;
-      }
-    }
+    // PTCP SYN → wait for SYN-ACK through relay agent
+    // mainSock has NAT mapping with agent (from relay/start), so this works on Render.
+    // Valid creds → device accepted channel → connected to agent → SYN-ACK arrives.
+    // Invalid creds → device rejected (403) → didn't connect to agent → timeout.
+    await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
+    result.steps.push('PTCP SYN sent to agent');
 
-    // If not found in queued messages, race recv() on both sockets
-    if (!devParsed) {
-      for (var chanAttempt = 0; chanAttempt < 8 && !devParsed; chanAttempt++) {
-        try {
-          var raceResult = await Promise.race([
-            deviceSock.recv(30000).then(function(d) { return { data: d, src: 'deviceSock' }; }),
-            mainSock.recv(30000).then(function(d) { return { data: d, src: 'mainSock' }; })
-          ]);
-          result.steps.push('Recv on ' + raceResult.src + ': len=' + raceResult.data.length + ' first=0x' + raceResult.data[0].toString(16));
-          if (raceResult.data[0] !== 0x44 && raceResult.data[0] !== 0x48) continue;
-          devParsed = parseP2PResponse(raceResult.data);
-          if (devParsed.code === 200 || devParsed.code >= 400) break;
-          devParsed = null;
-        } catch(e) {
-          result.steps.push('Recv timeout: ' + e.message);
-          break;
-        }
-      }
-    }
-
-    if (!devParsed) { result.error = 'No response from device (NAT blocked — try local proxy mode)'; return result; }
-    result.code = devParsed.code;
-    if (devParsed.code === 200) {
-      devParsed.xmlBody = parseChannelBody(devParsed.body, devParsed.xmlBody);
+    try {
+      var synAck = await mainSock.readPTCP(15000);
       result.authenticated = true;
-      result.device_info = {
-        identify: devParsed.xmlBody.Identify || null,
-        local_addr: devParsed.xmlBody.LocalAddr || null,
-        pub_addr: devParsed.xmlBody.PubAddr || null
-      };
-      result.steps.push('AUTH OK (200)');
-    } else if (devParsed.code === 403) {
+      result.steps.push('PTCP SYN-ACK received — credentials VALID');
+    } catch(e) {
       result.authenticated = false;
-      result.error = 'Invalid credentials (403)';
-      result.steps.push('AUTH FAILED (403)');
-    } else {
-      result.error = 'Channel error: ' + devParsed.code + ' ' + devParsed.status;
-      result.steps.push('Error: ' + devParsed.code);
+      result.error = 'Credenciales inválidas (el dispositivo rechazó el canal)';
+      result.steps.push('PTCP SYN-ACK timeout — credentials INVALID');
     }
+
     return result;
   } catch (err) {
     result.error = err.message;
@@ -1056,7 +1013,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.12', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.13', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1302,5 +1259,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.12 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.13 running on port ' + PORT);
 });
