@@ -805,9 +805,11 @@ async function checkP2P(serial) {
 
 // v4.9: Validate credentials via p2p-channel WITH auth — no PTCP/tunnel needed.
 // v4.10: Register relay-channel BEFORE reading response to route through relay agent.
-// v4.11: DON'T clear message queues after relay-channel — the device response may
-//        have already arrived during relay/agent + relay/start steps (was being discarded).
-//        Now checks queued messages first, then races recv() on both sockets.
+// v4.11: DON'T clear queues — response may have arrived during relay setup.
+// v4.12: Send channel request to US SERVER (not main) and do probe/info on deviceSock.
+//        This creates a NAT mapping between deviceSock and the US server, which is
+//        where the channel response originates. On Render's symmetric NAT, the
+//        response was blocked because deviceSock only had a mapping with the main server.
 // Device returns 200 (valid) or 403 (invalid) at the channel response step.
 async function checkAuth(serial, username, password) {
   var result = { serial: serial, authenticated: false, steps: [] };
@@ -824,13 +826,19 @@ async function checkAuth(serial, username, password) {
     var usAddr = onlineRes.xmlBody.US;
     if (!usAddr) { result.error = 'Device not registered'; return result; }
     var usParts = usAddr.split(':');
+    var usServer = usParts[0];
+    var usPort = parseInt(usParts[1]);
     result.steps.push('US: ' + usAddr);
 
-    var usSock = new P2PSocket(); await usSock.bind(); usSock.setRemote(usParts[0], parseInt(usParts[1]));
-    await usSock.request('/probe/device/' + serial);
-    await usSock.request('/info/device/' + serial);
-    usSock.close();
-    result.steps.push('Device probe+info OK');
+    // v4.12: Do probe/device + info/device on DEVICE SOCK (not a separate socket).
+    // This creates a NAT mapping between deviceSock and the US server, so the
+    // device's channel response (which arrives FROM the US server) can get through
+    // Render's symmetric NAT. Previously this was done on a separate socket that
+    // was closed — deviceSock had no NAT mapping with the US server.
+    deviceSock.setRemote(usServer, usPort);
+    await deviceSock.request('/probe/device/' + serial);
+    await deviceSock.request('/info/device/' + serial);
+    result.steps.push('Device probe+info OK (via deviceSock→US)');
 
     var relayRes = await mainSock.request('/online/relay');
     var relayAddr = relayRes.xmlBody.Address;
@@ -848,9 +856,13 @@ async function checkAuth(serial, username, password) {
     // v2 format: auth + aidHex + 'true' + encLaddr + '5.0.0'
     var channelBody = auth + aidHex + 'true' + encLaddr + '5.0.0';
 
-    deviceSock.setRemote(mainIp, MAIN_PORT);
+    // v4.12: Send channel request to US SERVER (not main server).
+    // The device is registered with the US server, and the channel response
+    // comes FROM the US server. By sending the channel request to the US server
+    // from deviceSock, the NAT mapping already exists for the response.
+    deviceSock.setRemote(usServer, usPort);
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
-    result.steps.push('Channel sent (with auth)');
+    result.steps.push('Channel sent to US (with auth)');
 
     mainSock.setRemote(relayParts[0], parseInt(relayParts[1]));
     var agentRes = await mainSock.request('/relay/agent');
@@ -1044,7 +1056,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.11', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.12', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1290,5 +1302,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.11 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.12 running on port ' + PORT);
 });
