@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v4.6
+ * Dahua P2P Tunnel Relay Server v4.7
  * ===================================
+ * v4.7: ALIGNED WITH ACTUAL REFERENCE CODE (khoanguyen-3fc/dh-p2p main.py):
+ *   1. Added /probe/device + /info/device through US server (separate socket)
+ *      to debug_full — reference does this BEFORE channel request; without it,
+ *      the device doesn't respond to the channel request.
+ *   2. REMOVED NAT hole-punching — reference doesn't do it; the extra probe
+ *      from deviceSock to US server was interfering with device state.
  * v4.6: NAT HOLE-PUNCHING — Render/VPS NAT blocks UDP responses from IPs that
  *   the socket hasn't sent to. The channel request goes to MAIN_SERVER, but the
  *   device's response may arrive from the US server or device directly. Now we
@@ -454,19 +460,8 @@ async function establishTunnel(serial, username, password, targetPort) {
       auth = getDeviceAuth(username, key, nonce, '');
     }
 
-    // v4.6: NAT HOLE-PUNCHING — Send a probe from deviceSock to the US server
-    // BEFORE the channel request. Render/VPS NAT only allows UDP responses from
-    // IPs the socket has sent to. The channel response may come from the US
-    // server, not the main server, so we need a NAT mapping for the US server.
-    try {
-      var natProbe = buildP2PRequest('DHGET', '/probe/device/' + serial);
-      await deviceSock.sendTo(natProbe, usServer, usPort);
-      try { await deviceSock.recv(2000); } catch(e) {}
-      deviceSock._msgQueue = [];
-    } catch(e) {}
-
-    // v4.5: Channel request FIRST (matching reference order exactly)
-    // Reference sends p2p-channel BEFORE relay/agent and relay/start
+    // v4.7: NO NAT punch — reference (khoanguyen-3fc/dh-p2p main.py) doesn't do it.
+    // Channel request FIRST (matching reference order exactly)
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
     var laddrStr = '127.0.0.1:' + deviceSock.lport;
     var channelBody = aidHex + 'true' + laddrStr + '5.0.0';
@@ -817,7 +812,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.6', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.7', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -906,27 +901,34 @@ var server = http.createServer(async function(req, res) {
       dfSteps.push('Online: US=' + dfUS);
       var dfUSParts = dfUS.split(':');
 
+      // v4.7: Probe + info through US server with SEPARATE socket (matching reference exactly)
+      // Reference: p2psrv_remote.request("/probe/device/{SN}") then "/info/device/{SN}" then close
+      // This prepares the device for the channel request. Without it, device doesn't respond.
+      var dfUsSock = new P2PSocket(); await dfUsSock.bind(); dfUsSock.setRemote(dfUSParts[0], parseInt(dfUSParts[1]));
+      try {
+        var dfProbeRes = await dfUsSock.request('/probe/device/' + dfSerial);
+        dfSteps.push('Dev probe (US): ' + dfProbeRes.code);
+      } catch(e) { dfSteps.push('Dev probe (US) FAILED: ' + e.message); }
+      try {
+        var dfInfoRes = await dfUsSock.request('/info/device/' + dfSerial);
+        dfSteps.push('Dev info (US): ' + dfInfoRes.body.substring(0, 200));
+      } catch(e) { dfSteps.push('Dev info (US) FAILED: ' + e.message); }
+      dfUsSock.close();
+
       var dfRelayRes = await dfMain.request('/online/relay');
       var dfRelayAddr = dfRelayRes.xmlBody.Address || 'none';
       dfSteps.push('Relay: ' + dfRelayAddr);
       var dfRParts = dfRelayAddr.split(':');
 
-      // v4.6: NAT HOLE-PUNCHING — probe US server from dfDevSock before channel request
+      // v4.7: NO NAT punch — reference doesn't do it; it may interfere with device state
       var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
-      try {
-        var dfNatProbe = buildP2PRequest('DHGET', '/probe/device/' + dfSerial);
-        await dfDevSock.sendTo(dfNatProbe, dfUSParts[0], parseInt(dfUSParts[1]));
-        try { await dfDevSock.recv(2000); } catch(e) {}
-        dfDevSock._msgQueue = [];
-        dfSteps.push('NAT punch: probe sent to US server ' + dfUSParts[0] + ':' + parseInt(dfUSParts[1]));
-      } catch(e) { dfSteps.push('NAT punch: ' + e.message); }
 
-      // v4.5: Channel request FIRST (matching reference order)
+      // Channel request (matching reference: channel BEFORE relay/agent, plain text body)
       var dfAid = crypto.randomBytes(8);
       var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
       var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
       await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
-      dfSteps.push('Channel sent (plain text, BEFORE relay/agent)');
+      dfSteps.push('Channel sent (plain text, AFTER US probe/info, BEFORE relay/agent)');
 
       dfMain.setRemote(dfRParts[0], parseInt(dfRParts[1]));
       var dfAgent = await dfMain.request('/relay/agent');
@@ -1032,5 +1034,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.6 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.7 running on port ' + PORT);
 });
