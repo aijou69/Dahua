@@ -1,7 +1,17 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v4.2
+ * Dahua P2P Tunnel Relay Server v4.4
  * ===================================
+ * v4.4: ALIGNED WITH REFERENCE IMPLEMENTATION (khoanguyen-3fc/dh-p2p main.py):
+ *   1. p2p-channel body changed from XML to PLAIN TEXT ({aid_hex}true{laddr}5.0.0)
+ *   2. STUN responses REMOVED entirely — reference doesn't handle STUN at all.
+ *      Responding to STUN broke the agent's state machine (it kept sending STUN
+ *      instead of transitioning to PTCP). Now readPTCP just skips non-PTCP packets.
+ *   3. PTCP handshake simplified: read one packet from agent (discard), send SYN,
+ *      read SYN-ACK. No retry loop, no queue clearing, no STUN response.
+ * v4.3: FIXED STUN response — echoes ALL custom Dahua attributes from the request
+ *   (type 0x002A with device Identify) back in the response, plus XOR-MAPPED-ADDRESS.
+ *   Agent requires its custom attrs echoed to verify connection before PTCP.
  * v4.2: FIXED STUN response — now includes XOR-MAPPED-ADDRESS attribute so agent
  *   completes NAT hole-punch and accepts PTCP SYN-ACK.
  * v4.1: FIXED PTCP handshake — agent sends STUN Binding Requests before accepting PTCP;
@@ -147,10 +157,9 @@ function invertBuffer(buf) {
   return result;
 }
 
-// v4.2: Build STUN Binding Response with XOR-MAPPED-ADDRESS from a Binding Request
-// Agent sends STUN Binding Requests (type 0x0001) before accepting PTCP.
-// We respond with Binding Response (type 0x0101) including XOR-MAPPED-ADDRESS
-// so the agent learns our reflexive address and completes NAT hole-punch.
+// v4.3: Build STUN Binding Response that echoes ALL custom Dahua attributes
+// from the request + adds XOR-MAPPED-ADDRESS. The agent sends custom attrs
+// (type 0x002A with device Identify) that must be echoed back for verification.
 function buildXorMappedAddress(ip, port) {
   var xorPort = port ^ 0x2112;
   var ipParts = ip.split('.').map(Number);
@@ -170,13 +179,21 @@ function buildXorMappedAddress(ip, port) {
 
 function buildSTUNResponse(requestData, sourceIp, sourcePort) {
   if (requestData.length < 20) return null;
+  // v4.3: Echo ALL original attributes from the request (custom Dahua attrs like 0x002A)
+  var origAttrLen = requestData.readUInt16BE(2);
+  var origAttrs = requestData.subarray(20, 20 + origAttrLen);
+  // Build XOR-MAPPED-ADDRESS
   var xorAttr = buildXorMappedAddress(sourceIp, sourcePort);
-  var resp = Buffer.alloc(20 + xorAttr.length);
+  // Response: header(20) + original attrs (echoed) + XOR-MAPPED-ADDRESS
+  var resp = Buffer.alloc(20 + origAttrLen + xorAttr.length);
   resp[0] = 0x01; resp[1] = 0x01; // Binding Response
-  resp.writeUInt16BE(xorAttr.length, 2); // Length = attribute bytes
+  resp.writeUInt16BE(origAttrLen + xorAttr.length, 2);
   // Copy magic cookie (bytes 4-7) and transaction ID (bytes 8-19)
   requestData.copy(resp, 4, 4, 20);
-  xorAttr.copy(resp, 20);
+  // Echo original attributes
+  origAttrs.copy(resp, 20);
+  // Append XOR-MAPPED-ADDRESS
+  xorAttr.copy(resp, 20 + origAttrLen);
   return resp;
 }
 
@@ -318,21 +335,16 @@ P2PSocket.prototype.requestPTCP = function(body) {
 };
 
 P2PSocket.prototype.readPTCP = function(timeout) {
+  // v4.4: DON'T respond to STUN — reference implementation ignores STUN entirely.
+  // Responding to STUN breaks the agent's state machine (it keeps sending STUN
+  // instead of transitioning to PTCP). Just skip non-PTCP packets and wait.
   var self = this;
   var deadline = Date.now() + (timeout || 5000);
   function attempt() {
     var remaining = deadline - Date.now();
     if (remaining <= 0) return Promise.reject(new Error('Timeout (' + (timeout||5000) + 'ms)'));
     return self.recv(remaining).then(function(data) {
-      // v4.2: Respond to STUN binding requests with XOR-MAPPED-ADDRESS
-      if (data.length >= 20 && data[0] === 0x00 && data[1] === 0x01) {
-        var srcIp = (self._lastRinfo && self._lastRinfo.address) || self.rhost;
-        var srcPort = (self._lastRinfo && self._lastRinfo.port) || self.rport;
-        var stunResp = buildSTUNResponse(data, srcIp, srcPort);
-        if (stunResp) self.send(stunResp);
-        return attempt();
-      }
-      // Skip other non-PTCP packets (NAT residue, etc.)
+      // Skip STUN and any non-PTCP packets (don't respond, just discard)
       if (data.length < 24 || data.toString('ascii', 0, 4) !== 'PTCP') {
         return attempt();
       }
@@ -434,9 +446,10 @@ async function establishTunnel(serial, username, password, targetPort) {
     mainSock.setRemote(agentServer, agentPort);
     var startRes = await mainSock.request('/relay/start/' + token, ':0');
 
-    // p2p-channel: XML body (v4.0 fix: XML format works — device responds with Identify+LocalAddr+PubAddr)
+    // p2p-channel: PLAIN TEXT body (v4.4: matching reference — {aid_hex}true{laddr}5.0.0)
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
-    var channelBody = '<body><Identify>' + aidHex + '</Identify><PubAddr>' + agentServer + ':' + agentPort + '</PubAddr></body>\r\n';
+    var laddrStr = '127.0.0.1:' + deviceSock.lport;
+    var channelBody = aidHex + 'true' + laddrStr + '5.0.0';
     deviceSock.setRemote(mainIp, MAIN_PORT);
     await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
 
@@ -490,21 +503,14 @@ async function establishTunnel(serial, username, password, targetPort) {
     var relayChannelBody = relayAuth + agentServer + ':' + agentPort;
     await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
 
-    // Clear stale messages from relay/agent communication before PTCP handshake
-    mainSock._msgQueue = [];
+    // v4.4: Match reference exactly — read one packet from agent (initial STUN), discard it,
+    // then send PTCP SYN and read PTCP SYN-ACK. No STUN response, no queue clearing, no retry loop.
     mainSock.setRemote(agentServer, agentPort);
-    try { await mainSock.recv(3000); } catch(e) {}
-    mainSock._msgQueue = [];
+    try { await mainSock.recv(5000); } catch(e) {}
 
-    // PTCP handshake with agent (v4.1: readPTCP now responds to STUN binding requests automatically)
-    // Agent sends STUN Binding Requests before PTCP; readPTCP handles them + loops for PTCP SYN-ACK
-    var agentSynOk = false;
-    for (var synAttempt = 0; synAttempt < 5; synAttempt++) {
-      mainSock._msgQueue = [];
-      await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-      try { await mainSock.readPTCP(12000); agentSynOk = true; break; }
-      catch(e) { if (synAttempt === 4) throw e; }
-    }
+    // PTCP handshake with agent (readPTCP skips STUN packets automatically)
+    await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
+    await mainSock.readPTCP(15000);
 
     await mainSock.requestPTCP(Buffer.concat([Buffer.from([0x17, 0x00, 0x00, 0x00]), Buffer.alloc(8)]));
     var ptcpRes = await mainSock.readPTCP(8000);
@@ -778,7 +784,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.2', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.4', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -885,13 +891,13 @@ var server = http.createServer(async function(req, res) {
       dfSteps.push('Relay start (plain): code=' + dfStart.code + ' body=' + dfStart.body.substring(0, 300));
       dfSteps.push('Relay start xml: ' + JSON.stringify(dfStart.xmlBody));
 
-      // Channel request (XML body — v4.0: XML works for p2p-channel)
+      // Channel request (PLAIN TEXT body — v4.4: matching reference)
       var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
       var dfAid = crypto.randomBytes(8);
       var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
-      var dfChanBody = '<body><Identify>' + dfAidHex + '</Identify><PubAddr>' + dfAParts[0] + ':' + parseInt(dfAParts[1]) + '</PubAddr></body>\r\n';
+      var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
       await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
-      dfSteps.push('Channel sent (XML body)');
+      dfSteps.push('Channel sent (plain text body)');
 
       var dfDevParsed = null;
       for (var dfi = 0; dfi < 8; dfi++) {
@@ -916,58 +922,23 @@ var server = http.createServer(async function(req, res) {
         await dfMain.request('/device/'+dfSerial+'/relay-channel', dfRelayChanBody, false);
         dfSteps.push('Relay-channel sent (plain text)');
 
-        // Read agent response after relay-channel registration
-        dfMain._msgQueue = [];
+        // v4.4: Match reference — read one packet from agent (STUN), discard, then PTCP SYN
         dfMain.setRemote(dfAParts[0], parseInt(dfAParts[1]));
         try {
           var agentResp = await dfMain.recv(5000);
-          var agentStr = agentResp.toString('utf8').substring(0, 300);
-          var agentMagic = agentResp.length >= 4 ? agentResp.toString('ascii', 0, 4) : 'short';
-          dfSteps.push('Agent resp: len=' + agentResp.length + ' magic=' + JSON.stringify(agentMagic) + ' text=' + agentStr);
+          dfSteps.push('Agent initial resp: len=' + agentResp.length + ' (discarded, matching reference)');
         } catch(e) { dfSteps.push('Agent resp: ' + e.message); }
-        dfMain._msgQueue = [];
 
-        // PTCP handshake with agent (v4.1: respond to STUN binding requests, loop for PTCP)
+        // PTCP handshake — send SYN, read SYN-ACK (readPTCP skips STUN automatically)
+        await dfMain.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
+        dfSteps.push('PTCP SYN sent to ' + dfAParts[0] + ':' + parseInt(dfAParts[1]));
         var dfSynOk = false;
-        for (var dfSyn = 0; dfSyn < 5; dfSyn++) {
-          dfMain._msgQueue = [];
-          await dfMain.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-          dfSteps.push('PTCP SYN sent (attempt ' + (dfSyn+1) + ') to ' + dfAParts[0] + ':' + parseInt(dfAParts[1]));
-          // v4.1: Loop reading packets — respond to STUN, break on PTCP
-          var innerDeadline = Date.now() + 12000;
-          while (Date.now() < innerDeadline) {
-            try {
-              var synRaw = await dfMain.recv(3000);
-              // v4.2: Check if STUN binding request (type 0x0001) — respond with XOR-MAPPED-ADDRESS
-              if (synRaw.length >= 20 && synRaw[0] === 0x00 && synRaw[1] === 0x01) {
-                var srcIp = (dfMain._lastRinfo && dfMain._lastRinfo.address) || dfMain.rhost;
-                var srcPort = (dfMain._lastRinfo && dfMain._lastRinfo.port) || dfMain.rport;
-                var stunResp = buildSTUNResponse(synRaw, srcIp, srcPort);
-                if (stunResp) {
-                  await dfMain.send(stunResp);
-                  dfSteps.push('  STUN binding request from ' + srcIp + ':' + srcPort + ' -> sent response with XOR-MAPPED-ADDRESS');
-                }
-                // Re-send PTCP SYN after STUN exchange (hole now punched)
-                await dfMain.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-                continue;
-              }
-              var synMagic = synRaw.length >= 4 ? synRaw.toString('ascii', 0, 4) : 'short';
-              dfSteps.push('  recv: len=' + synRaw.length + ' magic=' + JSON.stringify(synMagic));
-              if (synMagic === 'PTCP' && synRaw.length >= 24) {
-                var synParsed = dfMain.parsePTCP(synRaw);
-                dfMain.ptcpRecv += synParsed.body.length;
-                dfMain.rmid = synParsed.lmid;
-                dfSynOk = true;
-                dfSteps.push('PTCP SYN ACK received! body_len=' + synParsed.body.length);
-                break;
-              } else {
-                dfSteps.push('  NOT PTCP, hex=' + synRaw.toString('hex').substring(0, 60));
-              }
-            } catch(e) { /* inner timeout, continue loop */ }
-          }
-          if (dfSynOk) break;
-        }
-        if (!dfSynOk) dfSteps.push('PTCP handshake with agent FAILED after 5 attempts');
+        try {
+          var synAck = await dfMain.readPTCP(15000);
+          dfSynOk = true;
+          dfSteps.push('PTCP SYN-ACK received! body_len=' + synAck.body.length);
+        } catch(e) { dfSteps.push('PTCP SYN-ACK FAILED: ' + e.message); }
+        if (!dfSynOk) dfSteps.push('PTCP handshake with agent FAILED');
         else {
           await dfMain.requestPTCP(Buffer.concat([Buffer.from([0x17, 0x00, 0x00, 0x00]), Buffer.alloc(8)]));
           var dfPtcp = await dfMain.readPTCP(8000);
@@ -1017,5 +988,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.2 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.4 running on port ' + PORT);
 });
