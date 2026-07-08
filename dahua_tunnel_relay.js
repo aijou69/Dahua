@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v4.7
+ * Dahua P2P Tunnel Relay Server v4.8
  * ===================================
+ * v4.8: LOCAL PROXY MODE — PROXY_MODE=true env var enables transparent HTTP proxy
+ *   for local execution, bypassing Render's symmetric NAT that drops the device's
+ *   channel response (it arrives from a different IP than the main server).
+ *   Usage: PROXY_MODE=true SERIAL=5E07D56PBQBDEB3 node dahua_tunnel_relay.js
+ *   Then:  http://127.0.0.1:8081/cgi-bin/configManager.cgi?action=setConfig
  * v4.7: ALIGNED WITH ACTUAL REFERENCE CODE (khoanguyen-3fc/dh-p2p main.py):
  *   1. Added /probe/device + /info/device through US server (separate socket)
  *      to debug_full — reference does this BEFORE channel request; without it,
@@ -804,15 +809,107 @@ function readBody(req) {
   });
 }
 
+// v4.8: Local transparent proxy — tunnels HTTP requests through P2P
+var _cachedTunnel = null;
+var _cachedSerial = null;
+
+function clearCachedTunnel() {
+  if (_cachedTunnel) {
+    try { _cachedTunnel.deviceSock.close(); } catch(e) {}
+    try { _cachedTunnel.mainSock.close(); } catch(e) {}
+    _cachedTunnel = null;
+    _cachedSerial = null;
+  }
+}
+
+async function getCachedTunnel(serial, username, password) {
+  if (_cachedTunnel && _cachedSerial === serial) return _cachedTunnel;
+  clearCachedTunnel();
+  console.log('[*] Establishing P2P tunnel to ' + serial + '...');
+  var tunnel = await establishTunnel(serial, username, password, 80);
+  console.log('[+] Tunnel established');
+  _cachedTunnel = tunnel;
+  _cachedSerial = serial;
+  return tunnel;
+}
+
+async function handleProxyRequest(req, res) {
+  var urlObj = new URL(req.url, 'http://localhost');
+  var serial = urlObj.searchParams.get('sn') || process.env.SERIAL;
+  var username = urlObj.searchParams.get('user') || process.env.DAHUA_USER;
+  var password = urlObj.searchParams.get('pass') || process.env.DAHUA_PASS;
+
+  if (!serial) {
+    res.writeHead(400, {'Content-Type': 'text/plain'});
+    return res.end('Serial required. Set SERIAL env var or add ?sn= param.\nUsage: PROXY_MODE=true SERIAL=5E07D56PBQBDEB3 node dahua_tunnel_relay.js');
+  }
+
+  urlObj.searchParams.delete('sn');
+  urlObj.searchParams.delete('user');
+  urlObj.searchParams.delete('pass');
+
+  var cgiPath = urlObj.pathname;
+  if (urlObj.search) cgiPath += urlObj.search;
+
+  var body = '';
+  if (req.method === 'POST' || req.method === 'PUT') body = await readBody(req);
+
+  var fwdHeaders = {};
+  var hkeys = Object.keys(req.headers);
+  for (var hi = 0; hi < hkeys.length; hi++) {
+    var hk = hkeys[hi].toLowerCase();
+    if (hk === 'host' || hk === 'connection' || hk === 'content-length') continue;
+    fwdHeaders[hkeys[hi]] = req.headers[hkeys[hi]];
+  }
+
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      var tunnel = await getCachedTunnel(serial, username, password);
+      var realmId = await bindTunnelPort(tunnel.deviceSock, 80);
+      var resp = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, req.method, fwdHeaders, body);
+
+      if (resp.status === 401 && username && password) {
+        var wwwAuth = resp.headers['WWW-Authenticate'] || resp.headers['www-authenticate'];
+        if (wwwAuth) {
+          var dp = parseDigestAuth(wwwAuth);
+          fwdHeaders['Authorization'] = buildDigestAuth(req.method, cgiPath, dp, username, password);
+          realmId = await bindTunnelPort(tunnel.deviceSock, 80);
+          resp = await sendHTTPThroughTunnel(tunnel.deviceSock, realmId, cgiPath, req.method, fwdHeaders, body);
+        }
+      }
+
+      var cleanHeaders = {};
+      var rkeys = Object.keys(resp.headers);
+      for (var ri = 0; ri < rkeys.length; ri++) {
+        if (rkeys[ri].toLowerCase() === 'transfer-encoding') continue;
+        cleanHeaders[rkeys[ri]] = resp.headers[rkeys[ri]];
+      }
+
+      res.writeHead(resp.status, cleanHeaders);
+      return res.end(resp.body);
+    } catch(e) {
+      console.error('[!] Proxy error (attempt ' + (attempt+1) + '): ' + e.message);
+      clearCachedTunnel();
+      if (attempt === 1) {
+        res.writeHead(502, {'Content-Type': 'text/plain'});
+        return res.end('P2P tunnel error: ' + e.message + '\n');
+      }
+    }
+  }
+}
+
 var server = http.createServer(async function(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(200); return res.end(); }
 
+  // v4.8: Local transparent proxy mode
+  if (process.env.PROXY_MODE === 'true') { return handleProxyRequest(req, res); }
+
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.7b', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.8', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1047,5 +1144,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.7b running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.8 running on port ' + PORT);
 });
