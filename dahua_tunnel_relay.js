@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v4.1
+ * Dahua P2P Tunnel Relay Server v4.2
  * ===================================
+ * v4.2: FIXED STUN response — now includes XOR-MAPPED-ADDRESS attribute so agent
+ *   completes NAT hole-punch and accepts PTCP SYN-ACK.
  * v4.1: FIXED PTCP handshake — agent sends STUN Binding Requests before accepting PTCP;
  *   now responds with STUN Binding Responses, then PTCP SYN-ACK comes through.
  * v4.0: FIXED ROOT CAUSE — relay/start and relay-channel bodies changed to PLAIN TEXT
@@ -145,16 +147,36 @@ function invertBuffer(buf) {
   return result;
 }
 
-// v4.1: Build STUN Binding Response from a Binding Request
+// v4.2: Build STUN Binding Response with XOR-MAPPED-ADDRESS from a Binding Request
 // Agent sends STUN Binding Requests (type 0x0001) before accepting PTCP.
-// We respond with Binding Response (type 0x0101) to complete NAT hole-punch.
-function buildSTUNResponse(requestData) {
+// We respond with Binding Response (type 0x0101) including XOR-MAPPED-ADDRESS
+// so the agent learns our reflexive address and completes NAT hole-punch.
+function buildXorMappedAddress(ip, port) {
+  var xorPort = port ^ 0x2112;
+  var ipParts = ip.split('.').map(Number);
+  var cookie = [0x21, 0x12, 0xA4, 0x42];
+  var attr = Buffer.alloc(12);
+  attr.writeUInt16BE(0x0020, 0); // type: XOR-MAPPED-ADDRESS
+  attr.writeUInt16BE(8, 2);      // length: 8 bytes
+  attr[4] = 0x00;                // reserved
+  attr[5] = 0x01;                // family: IPv4
+  attr.writeUInt16BE(xorPort, 6);
+  attr[8]  = ipParts[0] ^ cookie[0];
+  attr[9]  = ipParts[1] ^ cookie[1];
+  attr[10] = ipParts[2] ^ cookie[2];
+  attr[11] = ipParts[3] ^ cookie[3];
+  return attr;
+}
+
+function buildSTUNResponse(requestData, sourceIp, sourcePort) {
   if (requestData.length < 20) return null;
-  var resp = Buffer.alloc(20);
+  var xorAttr = buildXorMappedAddress(sourceIp, sourcePort);
+  var resp = Buffer.alloc(20 + xorAttr.length);
   resp[0] = 0x01; resp[1] = 0x01; // Binding Response
-  resp.writeUInt16BE(0, 2); // Length = 0 (header only, no attributes)
+  resp.writeUInt16BE(xorAttr.length, 2); // Length = attribute bytes
   // Copy magic cookie (bytes 4-7) and transaction ID (bytes 8-19)
   requestData.copy(resp, 4, 4, 20);
+  xorAttr.copy(resp, 20);
   return resp;
 }
 
@@ -171,9 +193,11 @@ function P2PSocket() {
   this.rmid = 0;
   this._msgHandler = null;
   this._msgQueue = []; // FIX: buffer messages that arrive between operations
+  this._lastRinfo = null; // v4.2: capture source address of last received message
 
   var self = this;
-  this.sock.on('message', function(msg) {
+  this.sock.on('message', function(msg, rinfo) {
+    self._lastRinfo = rinfo; // v4.2: store source address for STUN response
     if (self._msgHandler) {
       var h = self._msgHandler;
       self._msgHandler = null;
@@ -300,9 +324,11 @@ P2PSocket.prototype.readPTCP = function(timeout) {
     var remaining = deadline - Date.now();
     if (remaining <= 0) return Promise.reject(new Error('Timeout (' + (timeout||5000) + 'ms)'));
     return self.recv(remaining).then(function(data) {
-      // v4.1: Respond to STUN binding requests (agent sends these before accepting PTCP)
+      // v4.2: Respond to STUN binding requests with XOR-MAPPED-ADDRESS
       if (data.length >= 20 && data[0] === 0x00 && data[1] === 0x01) {
-        var stunResp = buildSTUNResponse(data);
+        var srcIp = (self._lastRinfo && self._lastRinfo.address) || self.rhost;
+        var srcPort = (self._lastRinfo && self._lastRinfo.port) || self.rport;
+        var stunResp = buildSTUNResponse(data, srcIp, srcPort);
         if (stunResp) self.send(stunResp);
         return attempt();
       }
@@ -752,7 +778,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.1', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.2', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -912,12 +938,14 @@ var server = http.createServer(async function(req, res) {
           while (Date.now() < innerDeadline) {
             try {
               var synRaw = await dfMain.recv(3000);
-              // v4.1: Check if STUN binding request (type 0x0001)
+              // v4.2: Check if STUN binding request (type 0x0001) — respond with XOR-MAPPED-ADDRESS
               if (synRaw.length >= 20 && synRaw[0] === 0x00 && synRaw[1] === 0x01) {
-                var stunResp = buildSTUNResponse(synRaw);
+                var srcIp = (dfMain._lastRinfo && dfMain._lastRinfo.address) || dfMain.rhost;
+                var srcPort = (dfMain._lastRinfo && dfMain._lastRinfo.port) || dfMain.rport;
+                var stunResp = buildSTUNResponse(synRaw, srcIp, srcPort);
                 if (stunResp) {
                   await dfMain.send(stunResp);
-                  dfSteps.push('  STUN binding request received -> sent response');
+                  dfSteps.push('  STUN binding request from ' + srcIp + ':' + srcPort + ' -> sent response with XOR-MAPPED-ADDRESS');
                 }
                 // Re-send PTCP SYN after STUN exchange (hole now punched)
                 await dfMain.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
@@ -989,5 +1017,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.1 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.2 running on port ' + PORT);
 });
