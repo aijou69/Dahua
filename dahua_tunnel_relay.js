@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v4.5
+ * Dahua P2P Tunnel Relay Server v4.6
  * ===================================
+ * v4.6: NAT HOLE-PUNCHING — Render/VPS NAT blocks UDP responses from IPs that
+ *   the socket hasn't sent to. The channel request goes to MAIN_SERVER, but the
+ *   device's response may arrive from the US server or device directly. Now we
+ *   send a probe from deviceSock to the US server BEFORE the channel request,
+ *   creating a NAT mapping so the response can get through. Also increased
+ *   channel timeout from 8s to 30s (reference has no timeout at all) and added
+ *   raw packet logging in debug_full.
  * v4.5: FIXED OPERATION ORDER — reference sends p2p-channel BEFORE relay/agent
  *   and relay/start. We had it backwards (relay/agent → relay/start → channel).
  *   Device only responds to channel request if it's sent first.
@@ -278,6 +285,17 @@ P2PSocket.prototype.setRemote = function(host, port) {
   this.rport = port;
 };
 
+// v4.6: Send to a specific host:port without changing the default remote.
+// Used for NAT hole-punching — creates a NAT mapping for that destination.
+P2PSocket.prototype.sendTo = function(data, host, port) {
+  var self = this;
+  return new Promise(function(resolve, reject) {
+    self.sock.send(data, port, host, function(err) {
+      if (err) reject(err); else resolve();
+    });
+  });
+};
+
 P2PSocket.prototype.request = function(path, body, shouldRead) {
   var self = this;
   shouldRead = shouldRead !== false;
@@ -436,6 +454,17 @@ async function establishTunnel(serial, username, password, targetPort) {
       auth = getDeviceAuth(username, key, nonce, '');
     }
 
+    // v4.6: NAT HOLE-PUNCHING — Send a probe from deviceSock to the US server
+    // BEFORE the channel request. Render/VPS NAT only allows UDP responses from
+    // IPs the socket has sent to. The channel response may come from the US
+    // server, not the main server, so we need a NAT mapping for the US server.
+    try {
+      var natProbe = buildP2PRequest('DHGET', '/probe/device/' + serial);
+      await deviceSock.sendTo(natProbe, usServer, usPort);
+      try { await deviceSock.recv(2000); } catch(e) {}
+      deviceSock._msgQueue = [];
+    } catch(e) {}
+
     // v4.5: Channel request FIRST (matching reference order exactly)
     // Reference sends p2p-channel BEFORE relay/agent and relay/start
     var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
@@ -461,7 +490,7 @@ async function establishTunnel(serial, username, password, targetPort) {
     // STUN packets may arrive between 100 and 200
     var devParsed = null;
     for (var chanAttempt = 0; chanAttempt < 8; chanAttempt++) {
-      var devRaw = await deviceSock.recv(10000);
+      var devRaw = await deviceSock.recv(30000);
       // Skip STUN packets (binary, not ASCII HTTP)
       if (devRaw[0] !== 0x44 && devRaw[0] !== 0x48) { // not 'D' (DHPOST) or 'H' (HTTP)
         continue;
@@ -788,7 +817,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.5', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.6', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -882,8 +911,17 @@ var server = http.createServer(async function(req, res) {
       dfSteps.push('Relay: ' + dfRelayAddr);
       var dfRParts = dfRelayAddr.split(':');
 
-      // v4.5: Channel request FIRST (matching reference order)
+      // v4.6: NAT HOLE-PUNCHING — probe US server from dfDevSock before channel request
       var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
+      try {
+        var dfNatProbe = buildP2PRequest('DHGET', '/probe/device/' + dfSerial);
+        await dfDevSock.sendTo(dfNatProbe, dfUSParts[0], parseInt(dfUSParts[1]));
+        try { await dfDevSock.recv(2000); } catch(e) {}
+        dfDevSock._msgQueue = [];
+        dfSteps.push('NAT punch: probe sent to US server ' + dfUSParts[0] + ':' + parseInt(dfUSParts[1]));
+      } catch(e) { dfSteps.push('NAT punch: ' + e.message); }
+
+      // v4.5: Channel request FIRST (matching reference order)
       var dfAid = crypto.randomBytes(8);
       var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
       var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
@@ -905,8 +943,11 @@ var server = http.createServer(async function(req, res) {
       var dfDevParsed = null;
       for (var dfi = 0; dfi < 8; dfi++) {
         try {
-          var dfRaw = await dfDevSock.recv(8000);
-          if (dfRaw[0] !== 0x44 && dfRaw[0] !== 0x48) { dfSteps.push('  (STUN, skip)'); continue; }
+          var dfRaw = await dfDevSock.recv(30000);
+          // v4.6: Log raw packet info for debugging
+          var dfRawHex = Array.from(dfRaw.subarray(0, Math.min(dfRaw.length, 40))).map(function(b) { return b.toString(16).padStart(2, '0'); }).join(' ');
+          dfSteps.push('  RAW recv: len=' + dfRaw.length + ' first40hex=' + dfRawHex);
+          if (dfRaw[0] !== 0x44 && dfRaw[0] !== 0x48) { dfSteps.push('  (non-HTTP, skip)'); continue; }
           var dfResp = parseP2PResponse(dfRaw);
           dfSteps.push('Channel resp: code=' + dfResp.code + ' body=' + dfResp.body.substring(0,150));
           if (dfResp.code === 200) { dfDevParsed = parseChannelBody(dfResp.body, dfResp.xmlBody); break; }
@@ -991,5 +1032,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.5 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.6 running on port ' + PORT);
 });
