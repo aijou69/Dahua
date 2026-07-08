@@ -803,7 +803,7 @@ async function checkP2P(serial) {
   });
 }
 
-// v4.13: CREDENTIAL VALIDATION VIA PTCP HANDSHAKE (not channel response).
+// v4.14: CREDENTIAL VALIDATION VIA RELAY-CHANNEL RESPONSE.
 // Previous versions tried to read the device's channel response (200/403) directly,
 // but Render's symmetric NAT blocks it (response comes from device/US IP, not main IP).
 // New approach: send channel with auth → register relay-channel → PTCP handshake
@@ -868,33 +868,46 @@ async function checkAuth(serial, username, password) {
     await mainSock.request('/relay/start/' + token, ':0');
     result.steps.push('Relay started');
 
-    // Register relay-channel — tells device to connect to relay agent
+    // v4.14: Register relay-channel WITH shouldRead=true.
+    // relay-channel is sent to mainIp:MAIN_PORT — mainSock has NAT mapping with
+    // the main server (from initial probe), so the response gets through Render's NAT.
+    // Device returns 200 (valid creds) or 403 (invalid) as the relay-channel response.
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = getDeviceAuth(username, key, nonce, '');
     var relayChannelBody = relayAuth + agentParts[0] + ':' + parseInt(agentParts[1]);
-    await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
-    result.steps.push('Relay-channel registered');
+    var relayChanRes = await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, true);
+    result.steps.push('Relay-channel sent (waiting response)');
 
-    // Read agent initial packet (STUN), discard — provides delay for device to connect
-    mainSock.setRemote(agentParts[0], parseInt(agentParts[1]));
-    try { await mainSock.recv(5000); result.steps.push('Agent initial packet received'); }
-    catch(e) { result.steps.push('Agent initial packet: ' + e.message); }
-
-    // PTCP SYN → wait for SYN-ACK through relay agent
-    // mainSock has NAT mapping with agent (from relay/start), so this works on Render.
-    // Valid creds → device accepted channel → connected to agent → SYN-ACK arrives.
-    // Invalid creds → device rejected (403) → didn't connect to agent → timeout.
-    await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
-    result.steps.push('PTCP SYN sent to agent');
-
-    try {
-      var synAck = await mainSock.readPTCP(15000);
-      result.authenticated = true;
-      result.steps.push('PTCP SYN-ACK received — credentials VALID');
-    } catch(e) {
-      result.authenticated = false;
-      result.error = 'Credenciales inválidas (el dispositivo rechazó el canal)';
-      result.steps.push('PTCP SYN-ACK timeout — credentials INVALID');
+    if (relayChanRes) {
+      result.steps.push('Relay-channel response: code=' + relayChanRes.code);
+      result.code = relayChanRes.code;
+      if (relayChanRes.code === 200) {
+        result.authenticated = true;
+        result.steps.push('AUTH OK (200)');
+      } else if (relayChanRes.code === 403) {
+        result.authenticated = false;
+        result.error = 'Credenciales inválidas (403)';
+        result.steps.push('AUTH FAILED (403)');
+      } else {
+        result.authenticated = false;
+        result.error = 'Channel error: ' + relayChanRes.code;
+        result.steps.push('Error: ' + relayChanRes.code);
+      }
+    } else {
+      // No response from relay-channel — fall back to PTCP handshake test
+      result.steps.push('No relay-channel response, trying PTCP handshake...');
+      mainSock.setRemote(agentParts[0], parseInt(agentParts[1]));
+      try { await mainSock.recv(3000); } catch(e) {}
+      await mainSock.requestPTCP(Buffer.from([0x00, 0x03, 0x01, 0x00]));
+      try {
+        await mainSock.readPTCP(10000);
+        result.authenticated = true;
+        result.steps.push('PTCP SYN-ACK received — credentials VALID');
+      } catch(e) {
+        result.authenticated = false;
+        result.error = 'Credenciales inválidas (el dispositivo rechazó el canal)';
+        result.steps.push('PTCP timeout — credentials INVALID');
+      }
     }
 
     return result;
@@ -1013,7 +1026,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.13', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.14', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1259,5 +1272,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.13 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.14 running on port ' + PORT);
 });
