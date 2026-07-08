@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * Dahua P2P Tunnel Relay Server v4.4
+ * Dahua P2P Tunnel Relay Server v4.5
  * ===================================
+ * v4.5: FIXED OPERATION ORDER — reference sends p2p-channel BEFORE relay/agent
+ *   and relay/start. We had it backwards (relay/agent → relay/start → channel).
+ *   Device only responds to channel request if it's sent first.
  * v4.4: ALIGNED WITH REFERENCE IMPLEMENTATION (khoanguyen-3fc/dh-p2p main.py):
  *   1. p2p-channel body changed from XML to PLAIN TEXT ({aid_hex}true{laddr}5.0.0)
  *   2. STUN responses REMOVED entirely — reference doesn't handle STUN at all.
@@ -433,7 +436,15 @@ async function establishTunnel(serial, username, password, targetPort) {
       auth = getDeviceAuth(username, key, nonce, '');
     }
 
-    // Get relay agent (must happen BEFORE channel request)
+    // v4.5: Channel request FIRST (matching reference order exactly)
+    // Reference sends p2p-channel BEFORE relay/agent and relay/start
+    var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
+    var laddrStr = '127.0.0.1:' + deviceSock.lport;
+    var channelBody = aidHex + 'true' + laddrStr + '5.0.0';
+    deviceSock.setRemote(mainIp, MAIN_PORT);
+    await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
+
+    // Get relay agent
     mainSock.setRemote(relayServer, relayPort);
     var agentRes = await mainSock.request('/relay/agent');
     var token = agentRes.xmlBody.Token;
@@ -442,16 +453,9 @@ async function establishTunnel(serial, username, password, targetPort) {
     var agentServer = agentParts[0];
     var agentPort = parseInt(agentParts[1]);
 
-    // Start relay (PLAIN TEXT body — v4.0 fix: was XML, should be plain ":0")
+    // Start relay (PLAIN TEXT body — ":0")
     mainSock.setRemote(agentServer, agentPort);
     var startRes = await mainSock.request('/relay/start/' + token, ':0');
-
-    // p2p-channel: PLAIN TEXT body (v4.4: matching reference — {aid_hex}true{laddr}5.0.0)
-    var aidHex = Array.from(aid).map(function(b) { return b.toString(16); }).join(' ');
-    var laddrStr = '127.0.0.1:' + deviceSock.lport;
-    var channelBody = aidHex + 'true' + laddrStr + '5.0.0';
-    deviceSock.setRemote(mainIp, MAIN_PORT);
-    await deviceSock.request('/device/' + serial + '/p2p-channel', channelBody, false);
 
     // Read device channel response: HTTP 100 (Trying) first, then HTTP 200
     // STUN packets may arrive between 100 and 200
@@ -784,7 +788,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.4', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.5', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -878,6 +882,14 @@ var server = http.createServer(async function(req, res) {
       dfSteps.push('Relay: ' + dfRelayAddr);
       var dfRParts = dfRelayAddr.split(':');
 
+      // v4.5: Channel request FIRST (matching reference order)
+      var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
+      var dfAid = crypto.randomBytes(8);
+      var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
+      var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
+      await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
+      dfSteps.push('Channel sent (plain text, BEFORE relay/agent)');
+
       dfMain.setRemote(dfRParts[0], parseInt(dfRParts[1]));
       var dfAgent = await dfMain.request('/relay/agent');
       var dfAgentAddr = dfAgent.xmlBody.Agent || 'none';
@@ -888,16 +900,7 @@ var server = http.createServer(async function(req, res) {
       // Start relay (plain text)
       dfMain.setRemote(dfAParts[0], parseInt(dfAParts[1]));
       var dfStart = await dfMain.request('/relay/start/'+dfToken, ':0');
-      dfSteps.push('Relay start (plain): code=' + dfStart.code + ' body=' + dfStart.body.substring(0, 300));
-      dfSteps.push('Relay start xml: ' + JSON.stringify(dfStart.xmlBody));
-
-      // Channel request (PLAIN TEXT body — v4.4: matching reference)
-      var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
-      var dfAid = crypto.randomBytes(8);
-      var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
-      var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
-      await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
-      dfSteps.push('Channel sent (plain text body)');
+      dfSteps.push('Relay start: code=' + dfStart.code);
 
       var dfDevParsed = null;
       for (var dfi = 0; dfi < 8; dfi++) {
@@ -988,5 +991,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.4 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.5 running on port ' + PORT);
 });
