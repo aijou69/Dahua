@@ -804,8 +804,10 @@ async function checkP2P(serial) {
 }
 
 // v4.9: Validate credentials via p2p-channel WITH auth — no PTCP/tunnel needed.
-// v4.10: Register relay-channel BEFORE reading response to route through relay agent
-//        (bypasses Render symmetric NAT that blocks direct device→client UDP).
+// v4.10: Register relay-channel BEFORE reading response to route through relay agent.
+// v4.11: DON'T clear message queues after relay-channel — the device response may
+//        have already arrived during relay/agent + relay/start steps (was being discarded).
+//        Now checks queued messages first, then races recv() on both sockets.
 // Device returns 200 (valid) or 403 (invalid) at the channel response step.
 async function checkAuth(serial, username, password) {
   var result = { serial: serial, authenticated: false, steps: [] };
@@ -861,37 +863,49 @@ async function checkAuth(serial, username, password) {
     await mainSock.request('/relay/start/' + token, ':0');
     result.steps.push('Relay started');
 
-    // v4.10: Register relay-channel BEFORE reading channel response.
-    // On Render (symmetric NAT), the device's direct UDP response is dropped because
-    // deviceSock hasn't sent to the device's public IP. By registering relay-channel
-    // first, the device routes its response through the relay agent, which mainSock
-    // HAS communicated with (NAT mapping exists). We poll both sockets' queues.
+    // v4.10: Register relay-channel so device can route response via relay agent.
     mainSock.setRemote(mainIp, MAIN_PORT);
     var relayAuth = getDeviceAuth(username, key, nonce, '');
     var relayChannelBody = relayAuth + agentParts[0] + ':' + parseInt(agentParts[1]);
     await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
     result.steps.push('Relay-channel registered (route via agent)');
 
-    // Clear stale messages, then poll both sockets for the channel response
-    deviceSock._msgQueue = [];
-    mainSock._msgQueue = [];
-
+    // v4.11: DON'T clear queues — the device response may have already arrived
+    // during relay/agent + relay/start steps. Poll both sockets' queues for the
+    // channel response, checking any queued messages first, then waiting for new ones.
     var devParsed = null;
-    var deadline = Date.now() + 30000;
-    while (Date.now() < deadline && !devParsed) {
-      var msg = null;
-      if (deviceSock._msgQueue.length > 0) {
-        msg = deviceSock._msgQueue.shift();
-      } else if (mainSock._msgQueue.length > 0) {
-        msg = mainSock._msgQueue.shift();
-      }
-      if (msg) {
-        if (msg.length < 4 || (msg[0] !== 0x44 && msg[0] !== 0x48)) continue;
-        devParsed = parseP2PResponse(msg);
+
+    // Check queued messages first (response may have arrived during relay setup)
+    var allQueued = [];
+    while (deviceSock._msgQueue.length > 0) allQueued.push({ data: deviceSock._msgQueue.shift(), src: 'deviceSock' });
+    while (mainSock._msgQueue.length > 0) allQueued.push({ data: mainSock._msgQueue.shift(), src: 'mainSock' });
+    for (var qi = 0; qi < allQueued.length; qi++) {
+      var qItem = allQueued[qi];
+      result.steps.push('Queued on ' + qItem.src + ': len=' + qItem.data.length + ' first=0x' + qItem.data[0].toString(16));
+      if (qItem.data.length >= 4 && (qItem.data[0] === 0x44 || qItem.data[0] === 0x48)) {
+        devParsed = parseP2PResponse(qItem.data);
         if (devParsed.code === 200 || devParsed.code >= 400) break;
         devParsed = null;
-      } else {
-        await new Promise(function(r) { setTimeout(r, 500); });
+      }
+    }
+
+    // If not found in queued messages, race recv() on both sockets
+    if (!devParsed) {
+      for (var chanAttempt = 0; chanAttempt < 8 && !devParsed; chanAttempt++) {
+        try {
+          var raceResult = await Promise.race([
+            deviceSock.recv(30000).then(function(d) { return { data: d, src: 'deviceSock' }; }),
+            mainSock.recv(30000).then(function(d) { return { data: d, src: 'mainSock' }; })
+          ]);
+          result.steps.push('Recv on ' + raceResult.src + ': len=' + raceResult.data.length + ' first=0x' + raceResult.data[0].toString(16));
+          if (raceResult.data[0] !== 0x44 && raceResult.data[0] !== 0x48) continue;
+          devParsed = parseP2PResponse(raceResult.data);
+          if (devParsed.code === 200 || devParsed.code >= 400) break;
+          devParsed = null;
+        } catch(e) {
+          result.steps.push('Recv timeout: ' + e.message);
+          break;
+        }
       }
     }
 
@@ -1030,7 +1044,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.10', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.11', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1276,5 +1290,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.10 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.11 running on port ' + PORT);
 });
