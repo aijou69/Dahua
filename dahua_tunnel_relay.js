@@ -804,6 +804,8 @@ async function checkP2P(serial) {
 }
 
 // v4.9: Validate credentials via p2p-channel WITH auth — no PTCP/tunnel needed.
+// v4.10: Register relay-channel BEFORE reading response to route through relay agent
+//        (bypasses Render symmetric NAT that blocks direct device→client UDP).
 // Device returns 200 (valid) or 403 (invalid) at the channel response step.
 async function checkAuth(serial, username, password) {
   var result = { serial: serial, authenticated: false, steps: [] };
@@ -859,15 +861,41 @@ async function checkAuth(serial, username, password) {
     await mainSock.request('/relay/start/' + token, ':0');
     result.steps.push('Relay started');
 
+    // v4.10: Register relay-channel BEFORE reading channel response.
+    // On Render (symmetric NAT), the device's direct UDP response is dropped because
+    // deviceSock hasn't sent to the device's public IP. By registering relay-channel
+    // first, the device routes its response through the relay agent, which mainSock
+    // HAS communicated with (NAT mapping exists). We poll both sockets' queues.
+    mainSock.setRemote(mainIp, MAIN_PORT);
+    var relayAuth = getDeviceAuth(username, key, nonce, '');
+    var relayChannelBody = relayAuth + agentParts[0] + ':' + parseInt(agentParts[1]);
+    await mainSock.request('/device/' + serial + '/relay-channel', relayChannelBody, false);
+    result.steps.push('Relay-channel registered (route via agent)');
+
+    // Clear stale messages, then poll both sockets for the channel response
+    deviceSock._msgQueue = [];
+    mainSock._msgQueue = [];
+
     var devParsed = null;
-    for (var chanAttempt = 0; chanAttempt < 8; chanAttempt++) {
-      var devRaw = await deviceSock.recv(30000);
-      if (devRaw[0] !== 0x44 && devRaw[0] !== 0x48) continue;
-      devParsed = parseP2PResponse(devRaw);
-      if (devParsed.code === 200 || devParsed.code >= 400) break;
+    var deadline = Date.now() + 30000;
+    while (Date.now() < deadline && !devParsed) {
+      var msg = null;
+      if (deviceSock._msgQueue.length > 0) {
+        msg = deviceSock._msgQueue.shift();
+      } else if (mainSock._msgQueue.length > 0) {
+        msg = mainSock._msgQueue.shift();
+      }
+      if (msg) {
+        if (msg.length < 4 || (msg[0] !== 0x44 && msg[0] !== 0x48)) continue;
+        devParsed = parseP2PResponse(msg);
+        if (devParsed.code === 200 || devParsed.code >= 400) break;
+        devParsed = null;
+      } else {
+        await new Promise(function(r) { setTimeout(r, 500); });
+      }
     }
 
-    if (!devParsed) { result.error = 'No response from device'; return result; }
+    if (!devParsed) { result.error = 'No response from device (NAT blocked — try local proxy mode)'; return result; }
     result.code = devParsed.code;
     if (devParsed.code === 200) {
       devParsed.xmlBody = parseChannelBody(devParsed.body, devParsed.xmlBody);
@@ -1002,7 +1030,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.9', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.10', features: ['status','tunnel','cgi','debug','debug_full','exploit','check_auth'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -1248,5 +1276,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.9 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.10 running on port ' + PORT);
 });
