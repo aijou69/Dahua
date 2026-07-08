@@ -812,7 +812,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', version: '4.7', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
+    return res.end(JSON.stringify({ status: 'ok', version: '4.7b', features: ['status','tunnel','cgi','debug','debug_full','exploit'] }));
   }
 
   if (req.url.startsWith('/debug/') && req.method === 'GET') {
@@ -922,13 +922,14 @@ var server = http.createServer(async function(req, res) {
 
       // v4.7: NO NAT punch — reference doesn't do it; it may interfere with device state
       var dfDevSock = new P2PSocket(); await dfDevSock.bind(); dfDevSock.setRemote(dfIp, MAIN_PORT);
+      dfSteps.push('Sockets: main port=' + dfMain.lport + ', dev port=' + dfDevSock.lport);
 
       // Channel request (matching reference: channel BEFORE relay/agent, plain text body)
       var dfAid = crypto.randomBytes(8);
       var dfAidHex = Array.from(dfAid).map(function(b) { return b.toString(16); }).join(' ');
       var dfChanBody = dfAidHex + 'true127.0.0.1:' + dfDevSock.lport + '5.0.0';
       await dfDevSock.request('/device/'+dfSerial+'/p2p-channel', dfChanBody, false);
-      dfSteps.push('Channel sent (plain text, AFTER US probe/info, BEFORE relay/agent)');
+      dfSteps.push('Channel sent (plain text, dev port=' + dfDevSock.lport + ', AFTER US probe/info)');
 
       dfMain.setRemote(dfRParts[0], parseInt(dfRParts[1]));
       var dfAgent = await dfMain.request('/relay/agent');
@@ -956,7 +957,19 @@ var server = http.createServer(async function(req, res) {
           if (dfResp.code >= 400) { dfSteps.push('ERROR: ' + dfResp.code); break; }
         } catch(e) { dfSteps.push('Chan FAILED: ' + e.message); break; }
       }
-      if (!dfDevParsed) { dfSteps.push('No channel response — aborting'); dfDevSock.close(); dfMain.close(); }
+      if (!dfDevParsed) {
+        dfSteps.push('No channel response — checking if response went to main socket');
+        dfSteps.push('  dfDevSock queue: ' + dfDevSock._msgQueue.length + ' msgs');
+        dfSteps.push('  dfMain queue: ' + dfMain._msgQueue.length + ' msgs');
+        if (dfMain._msgQueue.length > 0) {
+          for (var qi = 0; qi < dfMain._msgQueue.length; qi++) {
+            var qMsg = dfMain._msgQueue[qi];
+            var qHex = Array.from(qMsg.subarray(0, Math.min(qMsg.length, 40))).map(function(b) { return b.toString(16).padStart(2, '0'); }).join(' ');
+            dfSteps.push('  dfMain queued[' + qi + ']: len=' + qMsg.length + ' first40hex=' + qHex);
+          }
+        }
+        dfDevSock.close(); dfMain.close();
+      }
       else {
         dfSteps.push('Parsed: LocalAddr=' + (dfDevParsed.LocalAddr||'none') + ' PubAddr=' + (dfDevParsed.PubAddr||'none'));
         var dfPubParts = dfDevParsed.PubAddr.split(':');
@@ -1034,5 +1047,5 @@ process.on('uncaughtException', function(e) { console.error('[FATAL]', e.message
 process.on('unhandledRejection', function(e) { console.error('[FATAL]', e); });
 
 server.listen(PORT, function() {
-  console.log('Dahua P2P Tunnel Relay v4.7 running on port ' + PORT);
+  console.log('Dahua P2P Tunnel Relay v4.7b running on port ' + PORT);
 });
